@@ -82,8 +82,31 @@ function Remover-Servico-Se-Existir($nssm, $nome) {
   }
 }
 
+function Aguardar-Servico-Rodando($nome, $segundos = 45) {
+  $limite = (Get-Date).AddSeconds($segundos)
+  do {
+    $servico = Get-Service -Name $nome -ErrorAction SilentlyContinue
+    if ($servico -and $servico.Status -eq "Running") {
+      Write-Host "Servico em execucao: $nome"
+      return
+    }
+    Start-Sleep -Seconds 2
+  } while ((Get-Date) -lt $limite)
+
+  $servicoFinal = Get-Service -Name $nome -ErrorAction SilentlyContinue
+  $status = if ($servicoFinal) { $servicoFinal.Status } else { "nao encontrado" }
+  Falhar "O servico $nome foi criado, mas nao iniciou corretamente. Status atual: $status. Verifique os logs em C:\Control S API Hub\logs."
+}
+
+function Encontrar-Servico-Postgres() {
+  $servico = Get-Service -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like "postgresql*" -or $_.DisplayName -like "postgresql*" } |
+    Select-Object -First 1
+  return $servico
+}
+
 function Instalar-Servico-ApiHub($nssm) {
-  Escrever-Titulo "Instalando servico Control S API Hub"
+  Escrever-Titulo "Instalando servico ControlSApiHub"
 
   $nodeCmd = Get-Command "node.exe" -ErrorAction SilentlyContinue
   $node = if ($nodeCmd) { $nodeCmd.Source } else { $null }
@@ -94,12 +117,21 @@ function Instalar-Servico-ApiHub($nssm) {
 
   $logsDir = Join-Path $InstallDir "logs"
   New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
+  $wrapperDir = Join-Path $env:ProgramData "ControlS\ControlSApiHub"
+  $wrapper = Join-Path $wrapperDir "start-api-hub.cmd"
+  New-Item -ItemType Directory -Force -Path $wrapperDir | Out-Null
+  Set-Content -Path $wrapper -Encoding ASCII -Value @"
+@echo off
+cd /d "$InstallDir"
+"$node" "$serverJs"
+"@
 
   Remover-Servico-Se-Existir $nssm $ApiServiceName
 
-  & $nssm install $ApiServiceName $node $serverJs | Out-Null
+  & $nssm install $ApiServiceName $wrapper | Out-Null
   & $nssm set $ApiServiceName AppDirectory $InstallDir | Out-Null
-  & $nssm set $ApiServiceName DisplayName "Control S API Hub" | Out-Null
+  & $nssm set $ApiServiceName AppParameters "" | Out-Null
+  & $nssm set $ApiServiceName DisplayName $ApiServiceName | Out-Null
   & $nssm set $ApiServiceName Description "Backend Node.js do Control S API Hub na porta $BackendPort." | Out-Null
   & $nssm set $ApiServiceName Start SERVICE_AUTO_START | Out-Null
   & $nssm set $ApiServiceName AppEnvironmentExtra "NODE_ENV=production" "PORT=$BackendPort" "HOST=0.0.0.0" "APP_PUBLIC_URL=$PublicUrl" "PORTAL_PUBLIC_URL=$PublicUrl" | Out-Null
@@ -111,7 +143,14 @@ function Instalar-Servico-ApiHub($nssm) {
   & $nssm set $ApiServiceName AppExit Default Restart | Out-Null
   & $nssm set $ApiServiceName AppRestartDelay 10000 | Out-Null
 
-  & $nssm start $ApiServiceName | Out-Null
+  $postgres = Encontrar-Servico-Postgres
+  if ($postgres) {
+    Write-Host "Configurando dependencia do PostgreSQL: $($postgres.Name)"
+    sc.exe config $ApiServiceName depend= $($postgres.Name) | Out-Null
+  }
+
+  Start-Service -Name $ApiServiceName
+  Aguardar-Servico-Rodando $ApiServiceName
   Write-Host "Servico instalado e iniciado: $ApiServiceName"
 }
 
@@ -122,7 +161,7 @@ function Instalar-Servico-Nginx($nssm) {
 
   $nginx = Join-Path $NginxDir "nginx.exe"
   if (!(Test-Path $nginx)) {
-    Write-Host "Nginx nao encontrado em $nginx. Serviço do Nginx ignorado." -ForegroundColor Yellow
+    Write-Host "Nginx nao encontrado em $nginx. Servico do Nginx ignorado." -ForegroundColor Yellow
     return
   }
 
@@ -130,23 +169,25 @@ function Instalar-Servico-Nginx($nssm) {
 
   & $nssm install $NginxServiceName $nginx "-p" $NginxDir | Out-Null
   & $nssm set $NginxServiceName AppDirectory $NginxDir | Out-Null
-  & $nssm set $NginxServiceName DisplayName "Control S API Hub - Nginx" | Out-Null
+  & $nssm set $NginxServiceName DisplayName $NginxServiceName | Out-Null
   & $nssm set $NginxServiceName Description "Proxy Nginx do Control S API Hub na porta 3333 encaminhando para 3335." | Out-Null
   & $nssm set $NginxServiceName Start SERVICE_AUTO_START | Out-Null
   & $nssm set $NginxServiceName AppExit Default Restart | Out-Null
   & $nssm set $NginxServiceName AppRestartDelay 10000 | Out-Null
 
-  & $nssm start $NginxServiceName | Out-Null
+  sc.exe config $NginxServiceName depend= $ApiServiceName | Out-Null
+  Start-Service -Name $NginxServiceName
+  Aguardar-Servico-Rodando $NginxServiceName
   Write-Host "Servico instalado e iniciado: $NginxServiceName"
 }
 
 function Remover-Tarefa-Antiga() {
   $taskName = "ControlSAPIHub"
-  $consulta = schtasks.exe /Query /TN $taskName 2>$null
+  cmd.exe /c "schtasks /Query /TN `"$taskName`" >nul 2>nul"
   if ($LASTEXITCODE -eq 0) {
     Escrever-Titulo "Removendo tarefa agendada antiga"
-    schtasks.exe /End /TN $taskName 2>$null | Out-Null
-    schtasks.exe /Delete /TN $taskName /F | Out-Null
+    cmd.exe /c "schtasks /End /TN `"$taskName`" >nul 2>nul"
+    cmd.exe /c "schtasks /Delete /TN `"$taskName`" /F >nul 2>nul"
     Write-Host "Tarefa agendada antiga removida: $taskName"
   }
 }
