@@ -128,30 +128,34 @@ Antes de executar, instale o PostgreSQL para Windows:
 https://www.enterprisedb.com/downloads/postgres-postgresql-downloads
 ```
 
-O instalador/atualizador copia arquivos, cria/configura `.env`, cria o banco PostgreSQL se necessário, cria as tabelas internas, instala dependências, libera firewall, cria atalho, registra a inicialização automática no Windows como padrão e inicia o portal ao final da instalação.
+O instalador/atualizador copia arquivos, cria/configura `.env`, cria o banco PostgreSQL se necessário, cria as tabelas internas, instala dependências, libera firewall, cria atalho, registra serviços do Windows e inicia o portal ao final da instalação.
 
-Por padrão, o instalador cria a tarefa do Windows:
-
-```text
-ControlSAPIHub
-```
-
-Essa tarefa roda como `SYSTEM`, inicia junto com o Windows e executa o backend em modo de supervisão simples. Se o PostgreSQL ainda estiver subindo e o backend encerrar, o script aguarda 10 segundos e tenta novamente. Os logs ficam em:
+Por padrão, o instalador cria os serviços do Windows:
 
 ```text
-C:\Control S API Hub\logs\backend-producao.log
+ControlSApiHub
+ControlSApiHubNginx
 ```
 
-Inicialização automática manual:
+O serviço `ControlSApiHub` roda o backend Node.js na porta `3335`. O serviço `ControlSApiHubNginx` roda o proxy Nginx na porta `3333`, encaminhando para `127.0.0.1:3335`.
 
-```cmd
-powershell.exe -ExecutionPolicy Bypass -File scripts\registrar-inicializacao-windows.ps1
+Os logs ficam em:
+
+```text
+C:\Control S API Hub\logs\servico-api-hub.log
+C:\Control S API Hub\logs\servico-api-hub-error.log
 ```
 
-Remover inicialização automática:
+Consultar serviços:
 
 ```cmd
-powershell.exe -ExecutionPolicy Bypass -File scripts\remover-inicializacao-windows.ps1
+powershell.exe -ExecutionPolicy Bypass -File scripts\status-servicos-windows.ps1
+```
+
+Remover serviços:
+
+```cmd
+powershell.exe -ExecutionPolicy Bypass -File scripts\remover-servicos-windows.ps1
 ```
 
 Parar o Control S API Hub nesta maquina, sem remover a inicializacao automatica:
@@ -160,7 +164,7 @@ Parar o Control S API Hub nesta maquina, sem remover a inicializacao automatica:
 PARAR_API_HUB.cmd
 ```
 
-Esse comando encerra o backend Node que esta usando a porta `3335` e o supervisor local. Na proxima inicializacao do Windows, a tarefa `ControlSAPIHub` sobe novamente, caso continue registrada.
+Esse comando encerra os serviços do Control S API Hub quando estiverem instalados.
 
 Instalação manual:
 

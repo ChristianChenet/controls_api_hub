@@ -9,7 +9,8 @@ param(
   [string]$PublicUrl = "http://api.monvizo.com.br:8080",
   [switch]$NaoCriarBanco,
   [switch]$NaoCriarAtalho,
-  [switch]$NaoConfigurarInicializacao
+  [switch]$NaoConfigurarInicializacao,
+  [switch]$NaoInstalarServico
 )
 
 $ErrorActionPreference = "Stop"
@@ -325,6 +326,22 @@ call "$cmd"
   Write-Host "Para remover: schtasks /Delete /TN `"$taskName`" /F"
 }
 
+function Configurar-Servicos-Windows($destino) {
+  if ($NaoInstalarServico) { return $false }
+
+  Escrever-Titulo "Configurando servicos do Windows"
+  $scriptServico = Join-Path $destino "scripts\instalar-servicos-windows.ps1"
+  if (!(Test-Path $scriptServico)) {
+    Falhar "Script de servico nao encontrado: $scriptServico"
+  }
+
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptServico -InstallDir $destino -BackendPort $BackendPort -PublicUrl $PublicUrl
+  if ($LASTEXITCODE -ne 0) {
+    Falhar "Nao foi possivel configurar os servicos do Windows."
+  }
+  return $true
+}
+
 function Iniciar-Agora($destino) {
   Escrever-Titulo "Iniciando Control S API Hub agora"
 
@@ -388,13 +405,16 @@ Criar-Env $InstallDir $senhaBanco
 Instalar-Dependencias $InstallDir
 Liberar-Firewall
 Criar-Atalho-Inicializacao $InstallDir
-Configurar-Inicializacao-Windows $InstallDir
-Iniciar-Agora $InstallDir
+$servicoConfigurado = Configurar-Servicos-Windows $InstallDir
+if (!$servicoConfigurado) {
+  Configurar-Inicializacao-Windows $InstallDir
+  Iniciar-Agora $InstallDir
+}
 
 Escrever-Titulo "Instalacao/atualizacao concluida"
 Write-Host "Para iniciar agora:"
 Write-Host "cd /d `"$InstallDir`""
-Write-Host "scripts\start-backend-producao.cmd"
+Write-Host "powershell.exe -ExecutionPolicy Bypass -File scripts\status-servicos-windows.ps1"
 Write-Host ""
 Write-Host "Depois acesse:"
 Write-Host "Interno Node: http://localhost:$BackendPort/"

@@ -29,6 +29,16 @@ process.env.JWT_SECRET = 'controls_teste';
 process.env.TOKEN_HASH_PEPPER = 'controls_teste';
 
 const { buildApp } = await import('../apps/backend/dist/app.js');
+const { validarSomenteConsulta } = await import('../apps/backend/dist/modules/engine/SqlExecutor.js');
+
+validarSomenteConsulta('WITH clientes AS (SELECT 1 AS codigo) SELECT codigo FROM clientes');
+try {
+  validarSomenteConsulta('WITH clientes AS (SELECT 1 AS codigo) DELETE FROM clientes');
+  throw new Error('Validacao permitiu WITH com comando destrutivo.');
+} catch (error) {
+  if (!String(error.message).includes('segurança')) throw error;
+}
+
 const app = await buildApp();
 
 async function call(method, url, body, token, expectedStatus) {

@@ -6,6 +6,15 @@ $ErrorActionPreference = "SilentlyContinue"
 
 Write-Host "Parando Control S API Hub..." -ForegroundColor Green
 
+$servicos = @("ControlSApiHub", "ControlSApiHubNginx")
+foreach ($nomeServico in $servicos) {
+  $servico = Get-Service -Name $nomeServico -ErrorAction SilentlyContinue
+  if ($servico -and $servico.Status -ne "Stopped") {
+    Write-Host "Parando servico: $nomeServico"
+    Stop-Service -Name $nomeServico -Force -ErrorAction SilentlyContinue
+  }
+}
+
 schtasks.exe /End /TN "ControlSAPIHub" | Out-Null
 
 $conexoes = Get-NetTCPConnection -LocalPort $Porta -State Listen -ErrorAction SilentlyContinue

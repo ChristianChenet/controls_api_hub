@@ -9,16 +9,18 @@ function senha(conexao: ConexaoBanco) {
 
 export function validarSomenteConsulta(sql: string) {
   const normalizado = sql.trim();
-  const mensagem = 'Por segurança, o teste permite apenas consultas SELECT ou procedures de API contendo API no nome.';
+  const mensagem = 'Por segurança, o teste permite apenas consultas SELECT, consultas WITH ou procedures de API contendo API no nome.';
   const nomeProcedure = normalizado.match(/^exec(?:ute)?\s+([^\s(;]+)/i)?.[1] ?? '';
+  const proibidos = /\b(insert|update|delete|drop|alter|create|truncate|merge|grant|revoke)\b/i;
 
   // CONTROL S - ALTERAÇÃO MON: permite teste de procedures de API contendo API no nome.
   if (/^select\b/i.test(normalizado)) return;
+  // CONTROL S - ALTERAÇÃO MON: permite consultas WITH/CTE seguras iniciadas com WITH.
+  if (/^with\b/i.test(normalizado) && !proibidos.test(normalizado) && /\bselect\b/i.test(normalizado)) return;
   if (/^exec(?:ute)?\b/i.test(normalizado) && nomeProcedure.replace(/[\[\]"`]/g, '').toUpperCase().includes('API')) return;
 
   // CONTROL S - ALTERAÇÃO MON: permite teste de procedures de API contendo API no nome.
-  const proibidos = /\b(insert|update|delete|drop|alter|create|truncate|merge|grant|revoke)\b/i;
-  if (proibidos.test(normalizado) || !/^select\b/i.test(normalizado)) {
+  if (proibidos.test(normalizado) || !/^(select|with)\b/i.test(normalizado)) {
     throw new Error(mensagem);
   }
 }
