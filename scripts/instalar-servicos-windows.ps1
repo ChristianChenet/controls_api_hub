@@ -106,9 +106,19 @@ function Encontrar-Servico-Postgres() {
 }
 
 function Configurar-Recuperacao-Servico($nome) {
+  sc.exe config $nome start= auto | Out-Null
   sc.exe config $nome start= delayed-auto | Out-Null
   sc.exe failure $nome reset= 86400 actions= restart/60000/restart/60000/restart/60000 | Out-Null
   sc.exe failureflag $nome 1 | Out-Null
+}
+
+function Encerrar-Nginx-Remanescente() {
+  $processos = Get-Process -Name "nginx" -ErrorAction SilentlyContinue
+  if ($processos) {
+    Write-Host "Encerrando processos antigos do Nginx para liberar a porta 3333..."
+    $processos | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+  }
 }
 
 function Instalar-Servico-ApiHub($nssm) {
@@ -172,13 +182,20 @@ function Instalar-Servico-Nginx($nssm) {
     return
   }
 
-  Remover-Servico-Se-Existir $nssm $NginxServiceName
+  $testeNginx = & $nginx -p $NginxDir -t 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host ($testeNginx | Out-String) -ForegroundColor Red
+    Falhar "A configuracao do Nginx nao esta valida. Corrija C:\nginx\conf\nginx.conf antes de iniciar o servico."
+  }
 
-  & $nssm install $NginxServiceName $nginx "-p" $NginxDir | Out-Null
+  Remover-Servico-Se-Existir $nssm $NginxServiceName
+  Encerrar-Nginx-Remanescente
+
+  & $nssm install $NginxServiceName $nginx | Out-Null
   & $nssm set $NginxServiceName AppDirectory $NginxDir | Out-Null
+  & $nssm set $NginxServiceName AppParameters "-p `"$NginxDir`" -g `"daemon off;`"" | Out-Null
   & $nssm set $NginxServiceName DisplayName $NginxServiceName | Out-Null
   & $nssm set $NginxServiceName Description "Proxy Nginx do Control S API Hub na porta 3333 encaminhando para 3335." | Out-Null
-  & $nssm set $NginxServiceName Start SERVICE_AUTO_START | Out-Null
   & $nssm set $NginxServiceName AppExit Default Restart | Out-Null
   & $nssm set $NginxServiceName AppRestartDelay 10000 | Out-Null
   Configurar-Recuperacao-Servico $NginxServiceName
