@@ -28,6 +28,7 @@ Copy-Item (Join-Path $raiz "INSTALAR_OU_ATUALIZAR.cmd") $pacote -Force
 Copy-Item (Join-Path $raiz "RESTAURAR_BACKUP.ps1") $pacote -Force
 Copy-Item (Join-Path $raiz "RESTAURAR_BACKUP.cmd") $pacote -Force
 Copy-Item (Join-Path $raiz "PARAR_API_HUB.cmd") $pacote -Force
+Copy-Item (Join-Path $raiz "CORRIGIR_SERVICOS_WINDOWS.cmd") $pacote -Force
 
 Copy-Item (Join-Path $raiz "apps\backend\package.json") (Join-Path $pacote "apps\backend\package.json") -Force
 Copy-Item (Join-Path $raiz "apps\frontend\package.json") (Join-Path $pacote "apps\frontend\package.json") -Force
