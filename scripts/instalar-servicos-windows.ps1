@@ -105,6 +105,12 @@ function Encontrar-Servico-Postgres() {
   return $servico
 }
 
+function Configurar-Recuperacao-Servico($nome) {
+  sc.exe config $nome start= delayed-auto | Out-Null
+  sc.exe failure $nome reset= 86400 actions= restart/60000/restart/60000/restart/60000 | Out-Null
+  sc.exe failureflag $nome 1 | Out-Null
+}
+
 function Instalar-Servico-ApiHub($nssm) {
   Escrever-Titulo "Instalando servico ControlSApiHub"
 
@@ -142,6 +148,7 @@ cd /d "$InstallDir"
   & $nssm set $ApiServiceName AppRotateBytes 10485760 | Out-Null
   & $nssm set $ApiServiceName AppExit Default Restart | Out-Null
   & $nssm set $ApiServiceName AppRestartDelay 10000 | Out-Null
+  Configurar-Recuperacao-Servico $ApiServiceName
 
   $postgres = Encontrar-Servico-Postgres
   if ($postgres) {
@@ -174,11 +181,71 @@ function Instalar-Servico-Nginx($nssm) {
   & $nssm set $NginxServiceName Start SERVICE_AUTO_START | Out-Null
   & $nssm set $NginxServiceName AppExit Default Restart | Out-Null
   & $nssm set $NginxServiceName AppRestartDelay 10000 | Out-Null
+  Configurar-Recuperacao-Servico $NginxServiceName
 
   sc.exe config $NginxServiceName depend= $ApiServiceName | Out-Null
   Start-Service -Name $NginxServiceName
   Aguardar-Servico-Rodando $NginxServiceName
   Write-Host "Servico instalado e iniciado: $NginxServiceName"
+}
+
+function Configurar-Tarefa-Garantia-Boot() {
+  Escrever-Titulo "Configurando garantia de inicializacao"
+
+  $bootstrapDir = Join-Path $env:ProgramData "ControlS\ControlSApiHub"
+  $bootstrapPs1 = Join-Path $bootstrapDir "garantir-servicos-api-hub.ps1"
+  $bootstrapCmd = Join-Path $bootstrapDir "garantir-servicos-api-hub.cmd"
+  New-Item -ItemType Directory -Force -Path $bootstrapDir | Out-Null
+
+  Set-Content -Path $bootstrapPs1 -Encoding UTF8 -Value @"
+`$ErrorActionPreference = "Continue"
+`$log = "$bootstrapDir\garantir-servicos-api-hub.log"
+function Add-Log(`$texto) { Add-Content -LiteralPath `$log -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `$texto) }
+
+New-Item -ItemType Directory -Force -Path "$bootstrapDir" | Out-Null
+Add-Log "Iniciando verificacao automatica dos servicos."
+
+`$postgres = Get-Service -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like "postgresql*" -or `$_.DisplayName -like "postgresql*" } | Select-Object -First 1
+if (`$postgres -and `$postgres.Status -ne "Running") {
+  Add-Log "Iniciando PostgreSQL: `$(`$postgres.Name)"
+  Start-Service -Name `$postgres.Name -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 12
+}
+
+`$api = Get-Service -Name "$ApiServiceName" -ErrorAction SilentlyContinue
+if (!`$api) {
+  Add-Log "Servico $ApiServiceName nao encontrado. Reinstalando."
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$InstallDir\scripts\instalar-servicos-windows.ps1" -InstallDir "$InstallDir" -NginxDir "$NginxDir" -ApiServiceName "$ApiServiceName" -NginxServiceName "$NginxServiceName" -BackendPort $BackendPort -PublicUrl "$PublicUrl"
+  exit
+}
+
+if (`$api.Status -ne "Running") {
+  Add-Log "Iniciando $ApiServiceName."
+  Start-Service -Name "$ApiServiceName" -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 15
+}
+
+`$nginx = Get-Service -Name "$NginxServiceName" -ErrorAction SilentlyContinue
+if (`$nginx -and `$nginx.Status -ne "Running") {
+  Add-Log "Iniciando $NginxServiceName."
+  Start-Service -Name "$NginxServiceName" -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 5
+}
+
+`$apiFinal = Get-Service -Name "$ApiServiceName" -ErrorAction SilentlyContinue
+`$nginxFinal = Get-Service -Name "$NginxServiceName" -ErrorAction SilentlyContinue
+Add-Log ("Status final: {0}={1}; {2}={3}" -f "$ApiServiceName", `$apiFinal.Status, "$NginxServiceName", `$nginxFinal.Status)
+"@
+
+  Set-Content -Path $bootstrapCmd -Encoding ASCII -Value @"
+@echo off
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$bootstrapPs1"
+"@
+
+  $taskName = "ControlSApiHubGarantirServicos"
+  schtasks.exe /Create /TN $taskName /SC ONSTART /DELAY 0001:00 /RU SYSTEM /RL HIGHEST /TR "`"$bootstrapCmd`"" /F | Out-Null
+  schtasks.exe /Create /TN "$taskName-Manutencao" /SC MINUTE /MO 5 /RU SYSTEM /RL HIGHEST /TR "`"$bootstrapCmd`"" /F | Out-Null
+  Write-Host "Tarefa de garantia configurada: $taskName"
 }
 
 function Remover-Tarefa-Antiga() {
@@ -200,6 +267,7 @@ $nssm = Instalar-Nssm-Se-Necessario
 Remover-Tarefa-Antiga
 Instalar-Servico-ApiHub $nssm
 Instalar-Servico-Nginx $nssm
+Configurar-Tarefa-Garantia-Boot
 
 Escrever-Titulo "Servicos configurados"
 Write-Host "Consultar API Hub:  Get-Service $ApiServiceName"
