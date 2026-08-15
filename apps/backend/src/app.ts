@@ -116,8 +116,14 @@ function regrasPadrao(api?: ApiCadastrada): ApiCadastrada['regras'] {
     ...(api?.regras ?? {}),
     paginacaoPermitida: api?.regras?.paginacaoPermitida ?? true,
     quantidadeMaximaPorPagina: api?.regras?.quantidadeMaximaPorPagina ?? 200,
-    timeoutMs: api?.regras?.timeoutMs ?? 30000
+    timeoutMs: api?.regras?.timeoutMs ?? (api?.timeoutSegundos ? api.timeoutSegundos * 1000 : 120000),
+    paginacaoNoBanco: api?.regras?.paginacaoNoBanco ?? false
   };
+}
+
+function timeoutPublicoMs(api: ApiCadastrada) {
+  const configurado = Number(api.regras?.timeoutMs || (api.timeoutSegundos ? api.timeoutSegundos * 1000 : 120000));
+  return Math.min(Math.max(configurado || 120000, 5000), 300000);
 }
 
 function normalizarPaginacao(entrada: Record<string, unknown>, api: ApiCadastrada) {
@@ -1113,12 +1119,31 @@ export async function buildApp() {
         registrarLog({ empresaId: api.empresaId || api.clienteId, apiId: api.id, clienteConsumidorId: autorizacao.token?.clienteConsumidorId, tokenId: autorizacao.token?.id, metodoHttp: request.method, endpoint: api.endpoint, statusHttp: 400, tempoRespostaMs: Date.now() - inicio, origemIp: request.ip, origemAcesso: 'local', parametrosRecebidos: entrada, erroCodigo: erros[0].codigo, mensagemErro: erros[0].mensagem });
         return reply.status(400).send({ sucesso: false, erro: erros[0] });
       }
-      const registros = await sqlExecutor.executar(conexao, api.sqlBase, parametrosSql);
-      const lista = Array.isArray(registros) ? registros : [];
       const { pagina, quantidadePorPagina } = normalizarPaginacao(entrada, api);
       const paginacaoAtiva = api.permitePaginacao !== false && api.paginacaoHabilitada !== false && api.regras?.paginacaoPermitida !== false;
+      const paginacaoNoBanco = paginacaoAtiva && api.regras?.paginacaoNoBanco === true && conexao.tipoBanco === 'sqlserver';
+      const timeoutMs = timeoutPublicoMs(api);
+      const registros = await sqlExecutor.executar(conexao, api.sqlBase, parametrosSql, paginacaoNoBanco ? {
+        timeoutMs,
+        paginacaoSqlServer: { pagina, quantidadePorPagina }
+      } : { timeoutMs });
+      const lista = Array.isArray(registros) ? registros : [];
+      const possuiProximaPaginaBanco = paginacaoNoBanco && lista.length > quantidadePorPagina;
+      const listaResposta = paginacaoNoBanco ? lista.slice(0, quantidadePorPagina) : lista;
       const paginado = paginacaoAtiva
-        ? aplicarPaginacao(lista, pagina, quantidadePorPagina)
+        ? paginacaoNoBanco
+          ? {
+              dados: listaResposta,
+              meta: {
+                pagina,
+                quantidadePorPagina,
+                totalRegistros: listaResposta.length,
+                totalPaginas: possuiProximaPaginaBanco ? pagina + 1 : pagina,
+                temProxima: possuiProximaPaginaBanco,
+                temAnterior: pagina > 1
+              }
+            }
+          : aplicarPaginacao(lista, pagina, quantidadePorPagina)
         : {
             dados: lista,
             meta: {
@@ -1133,8 +1158,15 @@ export async function buildApp() {
       registrarLog({ empresaId: api.empresaId || api.clienteId, apiId: api.id, clienteConsumidorId: autorizacao.token?.clienteConsumidorId, tokenId: autorizacao.token?.id, metodoHttp: request.method, endpoint: api.endpoint, statusHttp: 200, tempoRespostaMs: Date.now() - inicio, origemIp: request.ip, origemAcesso: 'local', parametrosRecebidos: entrada, totalRegistros: lista.length });
       return sucesso(paginado.dados, paginado.meta);
     } catch (error) {
-      registrarLog({ empresaId: api.empresaId || api.clienteId, apiId: api.id, metodoHttp: request.method, endpoint: api.endpoint, statusHttp: 500, tempoRespostaMs: Date.now() - inicio, origemIp: request.ip, origemAcesso: 'local', erroCodigo: 'ERRO_EXECUCAO_API_PUBLICA', mensagemErro: error instanceof Error ? error.message : 'Erro ao executar API publicada.' });
-      return reply.status(500).send(erro('ERRO_EXECUCAO_API_PUBLICA', error instanceof Error ? error.message : 'Erro ao executar API publicada.'));
+      const mensagemErro = error instanceof Error ? error.message : 'Erro ao executar API publicada.';
+      const ocorreuTimeout = /timeout|timed out|etimeout|cancel/i.test(mensagemErro);
+      const statusHttp = ocorreuTimeout ? 504 : 500;
+      const codigoErro = ocorreuTimeout ? 'TEMPO_LIMITE_CONSULTA' : 'ERRO_EXECUCAO_API_PUBLICA';
+      const mensagemPublica = ocorreuTimeout
+        ? 'A consulta excedeu o tempo limite configurado para esta API.'
+        : mensagemErro;
+      registrarLog({ empresaId: api.empresaId || api.clienteId, apiId: api.id, metodoHttp: request.method, endpoint: api.endpoint, statusHttp, tempoRespostaMs: Date.now() - inicio, origemIp: request.ip, origemAcesso: 'local', erroCodigo: codigoErro, mensagemErro });
+      return reply.status(statusHttp).send(erro(codigoErro, mensagemPublica));
     }
   });
 

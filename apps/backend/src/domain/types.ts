@@ -99,6 +99,7 @@ export interface RegraNegocioApi {
   timeoutMs?: number;
   removerMascaraDocumento?: boolean;
   paginacaoPermitida?: boolean;
+  paginacaoNoBanco?: boolean;
 }
 
 export interface CampoPublicoApi {
