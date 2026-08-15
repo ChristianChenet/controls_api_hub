@@ -2,14 +2,6 @@ import { ConexaoBanco } from '../../domain/types.js';
 
 type Parametros = Record<string, string | number | boolean | null | undefined>;
 
-interface OpcoesExecucao {
-  timeoutMs?: number;
-  paginacao?: {
-    pagina: number;
-    quantidadePorPagina: number;
-  };
-}
-
 function senha(conexao: ConexaoBanco) {
   if (!conexao.senhaCriptografada.startsWith('criptografado:')) return conexao.senhaCriptografada;
   return Buffer.from(conexao.senhaCriptografada.replace('criptografado:', ''), 'base64').toString('utf8');
@@ -42,12 +34,12 @@ function normalizarParametros(sql: string, parametros: Parametros) {
 }
 
 export class SqlExecutor {
-  async executar(conexao: ConexaoBanco, sql: string, parametros: Parametros = {}, opcoes: OpcoesExecucao = {}) {
+  async executar(conexao: ConexaoBanco, sql: string, parametros: Parametros = {}) {
     validarSomenteConsulta(sql);
     const binds = normalizarParametros(sql, parametros);
 
     if (conexao.tipoBanco === 'sqlserver') {
-      return this.executarSqlServer(conexao, sql, binds, opcoes);
+      return this.executarSqlServer(conexao, sql, binds);
     }
 
     if (conexao.tipoBanco === 'oracle') {
@@ -57,30 +49,7 @@ export class SqlExecutor {
     return this.executarFirebird(conexao, sql, binds);
   }
 
-  private prepararSqlServer(sql: string, opcoes: OpcoesExecucao) {
-    const consulta = sql.trim().replace(/;+\s*$/g, '');
-    const paginacao = opcoes.paginacao;
-    const ehProcedure = /^exec(?:ute)?\b/i.test(consulta);
-
-    if (!paginacao || ehProcedure) return { sql: consulta, parametrosPaginacao: {} };
-
-    const pagina = Math.max(Number(paginacao.pagina) || 1, 1);
-    const quantidadePorPagina = Math.max(Number(paginacao.quantidadePorPagina) || 100, 1);
-    const offset = (pagina - 1) * quantidadePorPagina;
-    const limiteComSobra = quantidadePorPagina + 1;
-    const possuiOrderBy = /\border\s+by\b/i.test(consulta);
-    const ordenacao = possuiOrderBy ? '' : ' ORDER BY (SELECT NULL)';
-
-    return {
-      sql: `${consulta}${ordenacao} OFFSET @__controlSOffset ROWS FETCH NEXT @__controlSLimite ROWS ONLY`,
-      parametrosPaginacao: {
-        __controlSOffset: offset,
-        __controlSLimite: limiteComSobra
-      }
-    };
-  }
-
-  private async executarSqlServer(conexao: ConexaoBanco, sql: string, parametros: Parametros, opcoes: OpcoesExecucao) {
+  private async executarSqlServer(conexao: ConexaoBanco, sql: string, parametros: Parametros) {
     let mssql: any;
     try {
       mssql = await import('mssql');
@@ -89,7 +58,6 @@ export class SqlExecutor {
     }
 
     const sqlDriver = mssql.default ?? mssql;
-    const timeoutMs = Math.max(Number(opcoes.timeoutMs || 30000), 5000);
     const pool = await sqlDriver.connect({
       server: conexao.host,
       port: conexao.porta,
@@ -100,15 +68,14 @@ export class SqlExecutor {
         encrypt: false,
         trustServerCertificate: true
       },
-      requestTimeout: timeoutMs,
-      connectionTimeout: Math.min(timeoutMs, 15000)
+      requestTimeout: 30000,
+      connectionTimeout: 15000
     });
 
     try {
       const request = pool.request();
-      const { sql: sqlPreparado, parametrosPaginacao } = this.prepararSqlServer(sql, opcoes);
-      Object.entries({ ...parametros, ...parametrosPaginacao }).forEach(([nome, valor]) => request.input(nome, valor));
-      const sqlServer = sqlPreparado.replace(/:([a-zA-Z_][a-zA-Z0-9_]*)/g, '@$1');
+      Object.entries(parametros).forEach(([nome, valor]) => request.input(nome, valor));
+      const sqlServer = sql.replace(/:([a-zA-Z_][a-zA-Z0-9_]*)/g, '@$1');
       const resultado = await request.query(sqlServer);
       return resultado.recordset ?? [];
     } finally {

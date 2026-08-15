@@ -1113,29 +1113,12 @@ export async function buildApp() {
         registrarLog({ empresaId: api.empresaId || api.clienteId, apiId: api.id, clienteConsumidorId: autorizacao.token?.clienteConsumidorId, tokenId: autorizacao.token?.id, metodoHttp: request.method, endpoint: api.endpoint, statusHttp: 400, tempoRespostaMs: Date.now() - inicio, origemIp: request.ip, origemAcesso: 'local', parametrosRecebidos: entrada, erroCodigo: erros[0].codigo, mensagemErro: erros[0].mensagem });
         return reply.status(400).send({ sucesso: false, erro: erros[0] });
       }
+      const registros = await sqlExecutor.executar(conexao, api.sqlBase, parametrosSql);
+      const lista = Array.isArray(registros) ? registros : [];
       const { pagina, quantidadePorPagina } = normalizarPaginacao(entrada, api);
       const paginacaoAtiva = api.permitePaginacao !== false && api.paginacaoHabilitada !== false && api.regras?.paginacaoPermitida !== false;
-      const timeoutConfiguradoMs = Number(api.regras?.timeoutMs || (api.timeoutSegundos ? api.timeoutSegundos * 1000 : 15000));
-      const timeoutMs = Math.min(Math.max(timeoutConfiguradoMs || 15000, 5000), 15000);
-      const registros = await sqlExecutor.executar(conexao, api.sqlBase, parametrosSql, paginacaoAtiva ? {
-        timeoutMs,
-        paginacao: { pagina, quantidadePorPagina }
-      } : { timeoutMs });
-      const lista = Array.isArray(registros) ? registros : [];
-      const possuiProximaPagina = paginacaoAtiva && lista.length > quantidadePorPagina;
-      const dadosRetorno = paginacaoAtiva ? lista.slice(0, quantidadePorPagina) : lista;
       const paginado = paginacaoAtiva
-        ? {
-            dados: dadosRetorno,
-            meta: {
-              pagina,
-              quantidadePorPagina,
-              totalRegistros: dadosRetorno.length,
-              totalPaginas: possuiProximaPagina ? pagina + 1 : pagina,
-              temProxima: possuiProximaPagina,
-              temAnterior: pagina > 1
-            }
-          }
+        ? aplicarPaginacao(lista, pagina, quantidadePorPagina)
         : {
             dados: lista,
             meta: {
@@ -1147,18 +1130,11 @@ export async function buildApp() {
               temAnterior: false
             }
           };
-      registrarLog({ empresaId: api.empresaId || api.clienteId, apiId: api.id, clienteConsumidorId: autorizacao.token?.clienteConsumidorId, tokenId: autorizacao.token?.id, metodoHttp: request.method, endpoint: api.endpoint, statusHttp: 200, tempoRespostaMs: Date.now() - inicio, origemIp: request.ip, origemAcesso: 'local', parametrosRecebidos: entrada, totalRegistros: dadosRetorno.length });
+      registrarLog({ empresaId: api.empresaId || api.clienteId, apiId: api.id, clienteConsumidorId: autorizacao.token?.clienteConsumidorId, tokenId: autorizacao.token?.id, metodoHttp: request.method, endpoint: api.endpoint, statusHttp: 200, tempoRespostaMs: Date.now() - inicio, origemIp: request.ip, origemAcesso: 'local', parametrosRecebidos: entrada, totalRegistros: lista.length });
       return sucesso(paginado.dados, paginado.meta);
     } catch (error) {
-      const mensagemErro = error instanceof Error ? error.message : 'Erro ao executar API publicada.';
-      const ocorreuTimeout = /timeout|timed out|etimeout|cancel/i.test(mensagemErro);
-      const statusHttp = ocorreuTimeout ? 504 : 500;
-      const codigoErro = ocorreuTimeout ? 'TEMPO_LIMITE_CONSULTA' : 'ERRO_EXECUCAO_API_PUBLICA';
-      const mensagemPublica = ocorreuTimeout
-        ? 'A consulta excedeu o tempo limite permitido. Reduza o período, utilize paginação ou tente novamente.'
-        : mensagemErro;
-      registrarLog({ empresaId: api.empresaId || api.clienteId, apiId: api.id, metodoHttp: request.method, endpoint: api.endpoint, statusHttp, tempoRespostaMs: Date.now() - inicio, origemIp: request.ip, origemAcesso: 'local', erroCodigo: codigoErro, mensagemErro });
-      return reply.status(statusHttp).send(erro(codigoErro, mensagemPublica));
+      registrarLog({ empresaId: api.empresaId || api.clienteId, apiId: api.id, metodoHttp: request.method, endpoint: api.endpoint, statusHttp: 500, tempoRespostaMs: Date.now() - inicio, origemIp: request.ip, origemAcesso: 'local', erroCodigo: 'ERRO_EXECUCAO_API_PUBLICA', mensagemErro: error instanceof Error ? error.message : 'Erro ao executar API publicada.' });
+      return reply.status(500).send(erro('ERRO_EXECUCAO_API_PUBLICA', error instanceof Error ? error.message : 'Erro ao executar API publicada.'));
     }
   });
 
