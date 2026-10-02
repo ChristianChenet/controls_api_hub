@@ -203,4 +203,97 @@ export interface Usuario {
   senhaHash?: string;
   primeiroAcesso: boolean;
   criadoEm: string;
+  menusPermitidos?: string[];
+  perfilAcessoId?: string;
+}
+
+export interface PerfilAcesso {
+  id: string;
+  nome: string;
+  descricao?: string;
+  menusPermitidos: string[];
+  permissoesAcoes?: string[];
+  tiposAlerta?: string[];
+  padrao?: boolean;
+  ativo: boolean;
+  criadoEm: string;
+  atualizadoEm?: string;
+}
+
+export type ProvedorIntegracao = 'gmobii';
+export type StatusIntegracao = 'ativa' | 'inativa' | 'erro';
+
+export interface Integracao {
+  id: string;
+  empresaId: string;
+  provedor: ProvedorIntegracao;
+  nome: string;
+  urlBase: string;
+  status: StatusIntegracao;
+  intervaloMinutos: number;
+  limitePorLote: number;
+  tokenConfigurado: boolean;
+  ultimoCursor?: string;
+  ultimaSincronizacao?: string;
+  ultimoSucesso?: string;
+  ultimaFalha?: string;
+  totalRegistros: number;
+  criadoEm: string;
+  atualizadoEm: string;
+}
+
+export interface ExecucaoIntegracao {
+  id: string;
+  integracaoId: string;
+  empresaId: string;
+  tipo: 'teste' | 'sincronizacao';
+  status: 'executando' | 'sucesso' | 'falha';
+  iniciadaEm: string;
+  finalizadaEm?: string;
+  duracaoMs?: number;
+  registrosRecebidos: number;
+  registrosInseridos: number;
+  registrosAtualizados: number;
+  lotesProcessados: number;
+  mensagem?: string;
+  codigoErro?: string;
+}
+
+export interface LogIntegracao {
+  id: string;
+  integracaoId: string;
+  execucaoId?: string;
+  empresaId: string;
+  nivel: 'informacao' | 'aviso' | 'erro';
+  evento: string;
+  mensagem: string;
+  statusHttp?: number;
+  duracaoMs?: number;
+  detalhes?: Record<string, unknown>;
+  criadoEm: string;
+}
+
+export interface AlertaIntegracao {
+  id: string;
+  integracaoId: string;
+  empresaId: string;
+  severidade: 'aviso' | 'critico';
+  titulo: string;
+  mensagem: string;
+  detalhes?: Record<string, unknown>;
+  lido: boolean;
+  criadoEm: string;
+  resolvidoEm?: string;
+}
+
+export interface DadoIntegracao {
+  id: string;
+  integracaoId: string;
+  empresaId: string;
+  tipo: string;
+  chaveExterna: string;
+  dataReferencia?: string;
+  conteudo: Record<string, unknown>;
+  criadoEm: string;
+  atualizadoEm: string;
 }

@@ -2,8 +2,9 @@ import cors from '@fastify/cors';
 import staticFiles from '@fastify/static';
 import Fastify from 'fastify';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { createReadStream, existsSync } from 'node:fs';
+import { mkdir, readdir, stat } from 'node:fs/promises';
+import { basename, extname, join, resolve, sep } from 'node:path';
 import { env } from './config/env.js';
 import * as seed from './data/mockStore.js';
 import { PersistentStore } from './database/PersistentStore.js';
@@ -24,9 +25,16 @@ import { ConnectionFactory } from './modules/conexoes/ConnectionFactory.js';
 import { OpenApiGenerator } from './modules/docs/OpenApiGenerator.js';
 import { ApiExecutionEngine } from './modules/engine/ApiExecutionEngine.js';
 import { SqlExecutor } from './modules/engine/SqlExecutor.js';
+import { ErroIntegracao } from './modules/integracoes/GmobiiClient.js';
+import { IntegracaoRepository } from './modules/integracoes/IntegracaoRepository.js';
+import { IntegracaoService } from './modules/integracoes/IntegracaoService.js';
+import { descriptografarSegredo } from './modules/integracoes/CofreCredenciais.js';
+import { ConstrushowIntegrationService } from './modules/integracoes/construshow/ConstrushowIntegrationService.js';
+import { ConfiguracaoNotificacao, configuracaoNotificacaoPadrao, NotificacaoEmailService } from './modules/notificacoes/NotificacaoEmailService.js';
 
 type Perfil = 'admin' | 'operador' | 'visualizador';
-type Sessao = { usuarioId: string; perfil: Perfil; empresaId?: string; empresasIds: string[] };
+type Sessao = { usuarioId: string; perfil: Perfil; empresaId?: string; empresasIds: string[]; menusPermitidos?: string[]; permissoesAcoes?:string[]; tiposAlerta?:string[] };
+const todosMenus = ['dashboard','clientes','conexoes','integracoes','apis','editor','consumidores','tokens','usuarios','perfis','logs','dominios','configuracoes'];
 
 const agora = () => new Date().toISOString();
 const somenteDigitos = (valor = '') => valor.replace(/\D/g, '');
@@ -163,8 +171,15 @@ export async function buildApp() {
   const sqlExecutor = new SqlExecutor();
   const store = new PersistentStore();
   await store.iniciar(seed);
+  const integracaoRepository = new IntegracaoRepository();
+  await integracaoRepository.criarSchema();
+  const integracaoService = new IntegracaoService(integracaoRepository);
+  const construshowService = new ConstrushowIntegrationService();
+  await construshowService.iniciar();
+  const notificacaoEmailService = new NotificacaoEmailService();
+  await notificacaoEmailService.iniciar();
 
-  const { clientes: empresas, conexoes, apis, tokens, logs, usuarios, usuariosEmpresas, clientesConsumidores } = store;
+  const { clientes: empresas, conexoes, apis, tokens, logs, usuarios, usuariosEmpresas, clientesConsumidores, perfisAcesso } = store;
 
   async function garantirCompatibilidadeDadosExistentes() {
     const primeiraEmpresa = empresas[0];
@@ -220,6 +235,30 @@ export async function buildApp() {
 
   await garantirCompatibilidadeDadosExistentes();
 
+  const perfilAdministradorExistente = perfisAcesso.find((perfil) => perfil.padrao) ?? perfisAcesso[0];
+  if (perfilAdministradorExistente && (!perfilAdministradorExistente.permissoesAcoes?.length || !perfilAdministradorExistente.tiposAlerta?.length)) {
+    perfilAdministradorExistente.permissoesAcoes = ['integracao.visualizar','integracao.configurar','integracao.sincronizar','integracao.ver_token','integracao.resolver_alerta','integracao.excluir_pedido','api.publicar','api.editar','api.excluir','cadastro.editar','cadastro.excluir'];
+    perfilAdministradorExistente.tiposAlerta = ['falha_integracao','divergencia_contrato','dados_incompletos'];
+    perfilAdministradorExistente.atualizadoEm = agora();
+    await store.salvar('perfisAcesso', perfilAdministradorExistente);
+  }
+  if (perfilAdministradorExistente && !perfilAdministradorExistente.permissoesAcoes?.includes('integracao.excluir_pedido')) {
+    perfilAdministradorExistente.permissoesAcoes = [...(perfilAdministradorExistente.permissoesAcoes ?? []),'integracao.excluir_pedido'];
+    perfilAdministradorExistente.atualizadoEm = agora();
+    await store.salvar('perfisAcesso', perfilAdministradorExistente);
+  }
+  if (perfilAdministradorExistente && !perfilAdministradorExistente.permissoesAcoes?.includes('notificacao.configurar')) {
+    perfilAdministradorExistente.permissoesAcoes = [...(perfilAdministradorExistente.permissoesAcoes ?? []),'notificacao.configurar'];
+    perfilAdministradorExistente.atualizadoEm = agora();
+    await store.salvar('perfisAcesso', perfilAdministradorExistente);
+  }
+
+  const perfilAdmin = () => perfisAcesso.find((perfil) => perfil.padrao) ?? perfisAcesso[0];
+  const menusDoUsuario = (usuario: Usuario) => perfisAcesso.find((perfil) => perfil.id === usuario.perfilAcessoId)?.menusPermitidos ?? usuario.menusPermitidos ?? todosMenus;
+  const permissoesDoUsuario = (usuario:Usuario) => perfisAcesso.find((perfil)=>perfil.id===usuario.perfilAcessoId)?.permissoesAcoes ?? [];
+  const alertasDoUsuario = (usuario:Usuario) => perfisAcesso.find((perfil)=>perfil.id===usuario.perfilAcessoId)?.tiposAlerta ?? [];
+  for (const usuario of usuarios) if (!usuario.perfilAcessoId && perfilAdmin()) { usuario.perfilAcessoId = perfilAdmin()!.id; await store.salvar('usuarios', usuario); }
+
   function obterBearer(request: { headers: Record<string, string | string[] | undefined> }) {
     const authorization = request.headers.authorization;
     const header = Array.isArray(authorization) ? authorization[0] : authorization;
@@ -272,6 +311,41 @@ export async function buildApp() {
     }
     return sessao;
   }
+
+  function exigirGerenciamentoUsuarios(request: { headers: Record<string, string | string[] | undefined> }, reply: any) {
+    const sessao = exigirSessao(request, reply);
+    if (!sessao) return undefined;
+    if (sessao.perfil !== 'admin' && !sessao.menusPermitidos?.includes('usuarios')) {
+      reply.status(403).send(erro('ACESSO_NEGADO', 'Seu perfil nao permite acessar o cadastro de usuarios.'));
+      return undefined;
+    }
+    return sessao;
+  }
+
+  const possuiPermissao=(sessao:Sessao,permissao:string)=>sessao.perfil==='admin'||Boolean(sessao.permissoesAcoes?.includes(permissao));
+  const exigirPermissao=(sessao:Sessao,permissao:string,reply:any,mensagem:string)=>{
+    if(possuiPermissao(sessao,permissao))return true;
+    reply.status(403).send(erro('ACESSO_NEGADO',mensagem));
+    return false;
+  };
+
+  app.addHook('preHandler',async(request,reply)=>{
+    const caminho=request.url.split('?')[0];
+    const configuracaoIntegracao=(request.method==='POST'&&caminho==='/api/admin/integracoes/gmobii')||
+      caminho==='/api/admin/integracoes/gmobii/construshow'||
+      caminho.startsWith('/api/admin/integracoes/gmobii/construshow/opcoes')||
+      caminho.startsWith('/api/admin/integracoes/gmobii/construshow/filiais-ativas')||
+      (request.method==='POST'&&/^\/api\/admin\/integracoes\/[^/]+\/testar$/.test(caminho));
+    if(!configuracaoIntegracao)return;
+    const sessao=exigirSessao(request as any,reply);
+    if(!sessao)return reply;
+    if(!exigirPermissao(sessao,'integracao.configurar',reply,'Seu perfil não permite acessar as configurações da integração.'))return reply;
+  });
+
+  const perfilAcessoAdministrador = (perfilId?:string) => {
+    const perfil=perfisAcesso.find((item)=>item.id===perfilId);
+    return Boolean(perfil?.padrao||perfil?.nome.trim().toLowerCase()==='admin'||perfil?.nome.trim().toLowerCase()==='administrador');
+  };
 
   function vincularUsuarioEmpresa(usuarioId: string, empresaId: string, perfil: Perfil, empresaPadrao = false) {
     const existente = usuariosEmpresas.find((item) => item.usuarioId === usuarioId && item.empresaId === empresaId);
@@ -388,6 +462,63 @@ export async function buildApp() {
   }
 
   app.get('/saude', async () => sucesso({ produto: 'Control S API Hub', status: 'operacional', ambiente: env.nodeEnv, banco: env.productDatabaseProvider }));
+  app.get('/documentacao/gmobii-original.pdf', async (_request, reply) => {
+    if (!existsSync(env.gmobiiDocumentationPath)) return reply.status(404).send(erro('DOCUMENTACAO_NAO_ENCONTRADA', 'O PDF original da GMOBii não foi encontrado no caminho configurado.'));
+    return reply.type('application/pdf').header('Content-Disposition','inline; filename="Documentacao-GMOBii-1.2.pdf"').send(createReadStream(env.gmobiiDocumentationPath));
+  });
+  app.get('/documentacao/gmobii-cancelamento-original.pdf', async (_request, reply) => {
+    if (!existsSync(env.gmobiiCancellationDocumentationPath)) return reply.status(404).send(erro('DOCUMENTACAO_NAO_ENCONTRADA', 'O PDF de cancelamento da GMOBii não foi encontrado no caminho configurado.'));
+    return reply.type('application/pdf').header('Content-Disposition','inline; filename="Documentacao-GMOBii-Cancelamento.pdf"').send(createReadStream(env.gmobiiCancellationDocumentationPath));
+  });
+  app.get('/documentacao/gmobii-aprovacao-original.pdf', async (_request, reply) => {
+    if (!existsSync(env.gmobiiApprovalDocumentationPath)) return reply.status(404).send(erro('DOCUMENTACAO_NAO_ENCONTRADA', 'O PDF de aprovação da GMOBii não foi encontrado no caminho configurado.'));
+    return reply.type('application/pdf').header('Content-Disposition','inline; filename="Documentacao-GMOBii-Aprovacao.pdf"').send(createReadStream(env.gmobiiApprovalDocumentationPath));
+  });
+  const tiposVideo = new Map<string,string>([
+    ['.mp4','video/mp4'],['.m4v','video/mp4'],['.webm','video/webm'],
+    ['.ogv','video/ogg'],['.ogg','video/ogg'],['.mov','video/quicktime'],
+    ['.avi','video/x-msvideo'],['.mkv','video/x-matroska'],['.wmv','video/x-ms-wmv'],
+    ['.flv','video/x-flv'],['.mpeg','video/mpeg'],['.mpg','video/mpeg'],
+    ['.3gp','video/3gpp'],['.ts','video/mp2t'],['.mts','video/mp2t'],['.m2ts','video/mp2t'],
+  ]);
+  const formatosReproducaoNativa = new Set(['.mp4','.m4v','.webm','.ogv','.ogg','.mov']);
+  app.get('/documentacao/gmobii-videos', async (_request, reply) => {
+    await mkdir(env.gmobiiVideosPath,{recursive:true});
+    const arquivos=await readdir(env.gmobiiVideosPath,{withFileTypes:true});
+    const videos=await Promise.all(arquivos.filter((arquivo)=>arquivo.isFile()&&!arquivo.name.startsWith('.')&&arquivo.name.toLowerCase()!=='leia-me.txt').map(async(arquivo)=>{
+      const extensao=extname(arquivo.name).toLowerCase();
+      const informacoes=await stat(join(env.gmobiiVideosPath,arquivo.name));
+      return {nome:arquivo.name,titulo:basename(arquivo.name,extensao).replace(/_/g,' ').trim(),formato:extensao.slice(1).toUpperCase()||'ARQUIVO',mimeType:tiposVideo.get(extensao)??'application/octet-stream',tamanhoBytes:informacoes.size,atualizadoEm:informacoes.mtime.toISOString(),reproducaoNativa:formatosReproducaoNativa.has(extensao),url:`/documentacao/gmobii-videos/${encodeURIComponent(arquivo.name)}`};
+    }));
+    videos.sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR',{numeric:true,sensitivity:'base'}));
+    return reply.header('Cache-Control','no-cache').send(sucesso({pasta:env.gmobiiVideosPath,videos}));
+  });
+  app.get<{Params:{arquivo:string}}>('/documentacao/gmobii-videos/:arquivo', async (request, reply) => {
+    const nome=basename(request.params.arquivo);
+    if(!nome||nome!==request.params.arquivo)return reply.status(400).send(erro('VIDEO_INVALIDO','Nome de vídeo inválido.'));
+    const extensao=extname(nome).toLowerCase();
+    const mimeType=tiposVideo.get(extensao)??'application/octet-stream';
+    const raiz=resolve(env.gmobiiVideosPath);
+    const caminho=resolve(raiz,nome);
+    if(!caminho.startsWith(`${raiz}${sep}`))return reply.status(400).send(erro('VIDEO_INVALIDO','Caminho de vídeo inválido.'));
+    let informacoes;
+    try{informacoes=await stat(caminho)}catch{return reply.status(404).send(erro('VIDEO_NAO_ENCONTRADO','O vídeo solicitado não foi encontrado.'))}
+    if(!informacoes.isFile())return reply.status(404).send(erro('VIDEO_NAO_ENCONTRADO','O vídeo solicitado não foi encontrado.'));
+    const tamanho=informacoes.size;
+    const range=request.headers.range;
+    reply.header('Accept-Ranges','bytes').header('Content-Type',mimeType).header('Content-Disposition',`inline; filename*=UTF-8''${encodeURIComponent(nome)}`).header('Cache-Control','private, max-age=3600');
+    if(range){
+      const partes=/^bytes=(\d*)-(\d*)$/i.exec(range.trim());
+      if(!partes)return reply.status(416).header('Content-Range',`bytes */${tamanho}`).send();
+      let inicio=partes[1]?Number(partes[1]):NaN;
+      let fim=partes[2]?Number(partes[2]):NaN;
+      if(Number.isNaN(inicio)&&!Number.isNaN(fim)){inicio=Math.max(tamanho-fim,0);fim=tamanho-1}
+      else {if(Number.isNaN(inicio))inicio=0;if(Number.isNaN(fim)||fim>=tamanho)fim=tamanho-1}
+      if(inicio<0||fim<inicio||inicio>=tamanho)return reply.status(416).header('Content-Range',`bytes */${tamanho}`).send();
+      return reply.status(206).header('Content-Range',`bytes ${inicio}-${fim}/${tamanho}`).header('Content-Length',String(fim-inicio+1)).send(createReadStream(caminho,{start:inicio,end:fim}));
+    }
+    return reply.header('Content-Length',String(tamanho)).send(createReadStream(caminho));
+  });
 
   app.post<{ Body: { email?: string; senha?: string; empresaId?: string } }>('/api/auth/login', async (request, reply) => {
     const email = request.body?.email?.trim().toLowerCase();
@@ -407,11 +538,11 @@ export async function buildApp() {
     if (!empresasUsuario.length) {
       if (usuario.perfil !== 'admin') return reply.status(403).send(erro('USUARIO_SEM_EMPRESA', 'Usuario nao possui empresa vinculada. Solicite acesso a um administrador.'));
       const token = randomUUID();
-      sessoes.set(token, { usuarioId: usuario.id, perfil: usuario.perfil, empresasIds: [] });
+      sessoes.set(token, { usuarioId: usuario.id, perfil: usuario.perfil, empresasIds: [], menusPermitidos: menusDoUsuario(usuario), permissoesAcoes:permissoesDoUsuario(usuario), tiposAlerta:alertasDoUsuario(usuario) });
       return sucesso({
         token,
         exigeCadastroEmpresa: true,
-        usuario: { id: usuario.id, nome: usuario.nome, nomeUsuario: usuario.nome, email: usuario.email, perfil: usuario.perfil },
+        usuario: { id: usuario.id, nome: usuario.nome, nomeUsuario: usuario.nome, email: usuario.email, perfil: usuario.perfil, perfilAcessoId: usuario.perfilAcessoId, menusPermitidos: menusDoUsuario(usuario), permissoesAcoes:permissoesDoUsuario(usuario), tiposAlerta:alertasDoUsuario(usuario) },
         empresas: [],
         empresaSelecionadaId: null
       });
@@ -423,10 +554,10 @@ export async function buildApp() {
 
     const token = randomUUID();
     const vinculo = usuariosEmpresas.find((item) => item.usuarioId === usuario.id && item.empresaId === empresaSelecionada.id);
-    sessoes.set(token, { usuarioId: usuario.id, perfil: vinculo?.perfil ?? usuario.perfil, empresaId: empresaSelecionada.id, empresasIds: empresasUsuario.map((empresa) => empresa.id) });
+    sessoes.set(token, { usuarioId: usuario.id, perfil: vinculo?.perfil ?? usuario.perfil, empresaId: empresaSelecionada.id, empresasIds: empresasUsuario.map((empresa) => empresa.id), menusPermitidos: menusDoUsuario(usuario), permissoesAcoes:permissoesDoUsuario(usuario), tiposAlerta:alertasDoUsuario(usuario) });
     return sucesso({
       token,
-      usuario: { id: usuario.id, nome: usuario.nome, nomeUsuario: usuario.nome, email: usuario.email, perfil: vinculo?.perfil ?? usuario.perfil },
+      usuario: { id: usuario.id, nome: usuario.nome, nomeUsuario: usuario.nome, email: usuario.email, perfil: vinculo?.perfil ?? usuario.perfil, perfilAcessoId: usuario.perfilAcessoId, menusPermitidos: menusDoUsuario(usuario), permissoesAcoes:permissoesDoUsuario(usuario), tiposAlerta:alertasDoUsuario(usuario) },
       empresas: empresasUsuario.map((empresa) => ({ id: empresa.id, nomeEmpresa: empresa.nomeEmpresa, nomeFantasia: empresa.nomeFantasia, perfil: empresa.perfil })),
       empresaSelecionadaId: empresaSelecionada.id
     });
@@ -561,20 +692,27 @@ export async function buildApp() {
   app.delete<{ Params: { id: string } }>('/api/admin/clientes/:id', (request, reply) => app.inject({ method: 'DELETE', url: `/api/admin/empresas/${request.params.id}`, headers: request.headers as any }).then((res) => reply.status(res.statusCode).send(JSON.parse(res.body))));
 
   app.get('/api/admin/usuarios', async (request, reply) => {
-    if (!exigirAdmin(request, reply)) return;
-    return sucesso(usuarios.map(({ senhaHash, ...usuario }) => ({ ...usuario, empresasIds: usuariosEmpresas.filter((vinculo) => vinculo.usuarioId === usuario.id && vinculo.ativo).map((vinculo) => vinculo.empresaId) })));
+    const sessao=exigirGerenciamentoUsuarios(request, reply);
+    if (!sessao) return;
+    const visiveis=sessao.perfil==='admin'?usuarios:usuarios.filter((usuario)=>usuario.perfil!=='admin'&&!perfilAcessoAdministrador(usuario.perfilAcessoId)&&usuariosEmpresas.some((vinculo)=>vinculo.usuarioId===usuario.id&&vinculo.ativo&&sessao.empresasIds.includes(vinculo.empresaId)));
+    return sucesso(visiveis.map(({ senhaHash, ...usuario }) => ({ ...usuario, empresasIds: usuariosEmpresas.filter((vinculo) => vinculo.usuarioId === usuario.id && vinculo.ativo).map((vinculo) => vinculo.empresaId) })));
   });
-  app.post<{ Body: { nome?: string; email?: string; perfil?: Perfil; status?: 'ativo' | 'inativo'; empresasIds?: string[] } }>('/api/admin/usuarios', async (request, reply) => {
-    const sessao = exigirAdmin(request, reply);
+  app.post<{ Body: { nome?: string; email?: string; perfil?: Perfil; status?: 'ativo' | 'inativo'; empresasIds?: string[]; perfilAcessoId?: string } }>('/api/admin/usuarios', async (request, reply) => {
+    const sessao = exigirGerenciamentoUsuarios(request, reply);
     if (!sessao) return;
     const body = request.body ?? {};
     if (!body.nome || !body.email || !body.perfil) return reply.status(400).send(erro('DADOS_USUARIO_INVALIDOS', 'Preencha nome, e-mail e perfil do usuario.'));
+    if(sessao.perfil!=='admin'&&body.perfil==='admin')return reply.status(403).send(erro('PERFIL_ADMIN_NAO_PERMITIDO','Somente administradores podem cadastrar outro usuario como Administrador.'));
+    if(sessao.perfil!=='admin'&&perfilAcessoAdministrador(body.perfilAcessoId))return reply.status(403).send(erro('GRUPO_ADMIN_NAO_PERMITIDO','Somente administradores podem vincular usuarios ao grupo Admin.'));
     const empresasAutorizadas = body.empresasIds?.length ? body.empresasIds : [sessao.empresaId].filter(Boolean) as string[];
     if (!empresasAutorizadas.length) return reply.status(400).send(erro('EMPRESA_USUARIO_NAO_INFORMADA', 'Selecione ao menos uma empresa para o usuario.'));
     if (empresasAutorizadas.some((empresaId) => !sessao.empresasIds.includes(empresaId))) return reply.status(403).send(erro('EMPRESA_NAO_AUTORIZADA', 'Voce so pode vincular usuarios as empresas que acessa.'));
     if (usuarios.some((usuario) => usuario.email.toLowerCase() === body.email!.toLowerCase())) return reply.status(409).send(erro('EMAIL_JA_CADASTRADO', 'Ja existe um usuario cadastrado com este e-mail.'));
     // CONTROL S - ALTERAÇÃO MON: corrige obrigatoriedade de senha no primeiro acesso.
-    const usuario: Usuario = { id: randomUUID(), nome: body.nome, email: body.email.toLowerCase(), perfil: body.perfil, status: body.status || 'ativo', primeiroAcesso: true, criadoEm: agora() };
+    const perfilSolicitado=perfisAcesso.find((perfil)=>perfil.id===body.perfilAcessoId&&perfil.ativo);
+    const perfilAcessoId = perfilSolicitado?.id ?? (sessao.perfil==='admin'?perfilAdmin()?.id:perfisAcesso.find((perfil)=>perfil.ativo&&!perfilAcessoAdministrador(perfil.id))?.id);
+    if(!perfilAcessoId)return reply.status(400).send(erro('PERFIL_ACESSO_OBRIGATORIO','Selecione um grupo de acesso permitido para o usuario.'));
+    const usuario: Usuario = { id: randomUUID(), nome: body.nome, email: body.email.toLowerCase(), perfil: body.perfil, status: body.status || 'ativo', primeiroAcesso: true, criadoEm: agora(), perfilAcessoId };
     usuarios.unshift(usuario);
     await store.salvar('usuarios', usuario);
     for (const empresaId of empresasAutorizadas) {
@@ -583,21 +721,27 @@ export async function buildApp() {
     }
     return reply.status(201).send(sucesso({ ...usuario, empresasIds: usuariosEmpresas.filter((v) => v.usuarioId === usuario.id).map((v) => v.empresaId) }));
   });
-  app.put<{ Params: { id: string }; Body: { nome?: string; email?: string; perfil?: Perfil; status?: 'ativo' | 'inativo'; empresasIds?: string[] } }>('/api/admin/usuarios/:id', async (request, reply) => {
-    const sessao = exigirAdmin(request, reply);
+  app.put<{ Params: { id: string }; Body: { nome?: string; email?: string; perfil?: Perfil; status?: 'ativo' | 'inativo'; empresasIds?: string[]; perfilAcessoId?: string } }>('/api/admin/usuarios/:id', async (request, reply) => {
+    const sessao = exigirGerenciamentoUsuarios(request, reply);
     if (!sessao) return;
     const usuario = usuarios.find((item) => item.id === request.params.id);
     if (!usuario) return reply.status(404).send(erro('USUARIO_NAO_ENCONTRADO', 'Usuario nao encontrado.'));
     const body = request.body ?? {};
     if (!body.nome || !body.email || !body.perfil) return reply.status(400).send(erro('DADOS_USUARIO_INVALIDOS', 'Preencha nome, e-mail e perfil do usuario.'));
+    const empresasAtuais=usuariosEmpresas.filter((vinculo)=>vinculo.usuarioId===usuario.id&&vinculo.ativo).map((vinculo)=>vinculo.empresaId);
+    if(sessao.perfil!=='admin'&&!empresasAtuais.some((empresaId)=>sessao.empresasIds.includes(empresaId)))return reply.status(403).send(erro('USUARIO_NAO_AUTORIZADO','Voce nao pode alterar usuarios de outra empresa.'));
+    if(sessao.perfil!=='admin'&&(usuario.perfil==='admin'||perfilAcessoAdministrador(usuario.perfilAcessoId)))return reply.status(403).send(erro('USUARIO_ADMIN_NAO_PERMITIDO','Somente administradores podem alterar usuarios administrativos.'));
+    if(sessao.perfil!=='admin'&&body.perfil==='admin')return reply.status(403).send(erro('PERFIL_ADMIN_NAO_PERMITIDO','Somente administradores podem definir o perfil Administrador.'));
+    if(sessao.perfil!=='admin'&&perfilAcessoAdministrador(body.perfilAcessoId))return reply.status(403).send(erro('GRUPO_ADMIN_NAO_PERMITIDO','Somente administradores podem vincular usuarios ao grupo Admin.'));
+    if (body.empresasIds?.some((empresaId) => !sessao.empresasIds.includes(empresaId))) return reply.status(403).send(erro('EMPRESA_NAO_AUTORIZADA', 'Voce so pode vincular usuarios as empresas que acessa.'));
     if (usuarios.some((item) => item.id !== usuario.id && item.email.toLowerCase() === body.email!.toLowerCase())) return reply.status(409).send(erro('EMAIL_JA_CADASTRADO', 'Ja existe outro usuario cadastrado com este e-mail.'));
     usuario.nome = body.nome;
     usuario.email = body.email.toLowerCase();
     usuario.perfil = body.perfil;
     usuario.status = body.status || usuario.status;
+    if (body.perfilAcessoId && perfisAcesso.some((perfil)=>perfil.id===body.perfilAcessoId)) usuario.perfilAcessoId = body.perfilAcessoId;
     await store.salvar('usuarios', usuario);
     if (body.empresasIds?.length) {
-      if (body.empresasIds.some((empresaId) => !sessao.empresasIds.includes(empresaId))) return reply.status(403).send(erro('EMPRESA_NAO_AUTORIZADA', 'Voce so pode vincular usuarios as empresas que acessa.'));
       for (const vinculo of usuariosEmpresas.filter((item) => item.usuarioId === usuario.id)) {
         vinculo.ativo = body.empresasIds.includes(vinculo.empresaId);
         await store.salvar('usuariosEmpresas', vinculo);
@@ -610,7 +754,9 @@ export async function buildApp() {
     return sucesso({ ...usuario, empresasIds: usuariosEmpresas.filter((v) => v.usuarioId === usuario.id && v.ativo).map((v) => v.empresaId) });
   });
   app.delete<{ Params: { id: string } }>('/api/admin/usuarios/:id', async (request, reply) => {
-    if (!exigirAdmin(request, reply)) return;
+    const sessao=exigirGerenciamentoUsuarios(request, reply);
+    if (!sessao) return;
+    if(sessao.perfil!=='admin')return reply.status(403).send(erro('EXCLUSAO_USUARIO_NAO_PERMITIDA','Seu perfil permite apenas inativar usuarios. A exclusao definitiva e exclusiva de administradores.'));
     const index = usuarios.findIndex((item) => item.id === request.params.id);
     if (index < 0) return reply.status(404).send(erro('USUARIO_NAO_ENCONTRADO', 'Usuario nao encontrado.'));
     usuarios.splice(index, 1);
@@ -698,6 +844,72 @@ export async function buildApp() {
     await store.salvar('conexoes', conexao);
     return sucesso(resultado);
   });
+
+  type ConfiguracaoConstrushow = { conexaoId:string;estab:number;estabDescricao?:string;estabProduto:number;estabProdutoDescricao?:string;estabNc:number;idNotaConf:number;notaConfDescricao?:string;idCliente?:number;clienteNome?:string;idVendedor?:number;vendedorNome?:string;validadeCarrinho:number;diasPrevisaoEntrega?:number;integracaoAutomatica?:boolean;intervaloIntegracaoMinutos?:number;modoExclusaoPedidos?:'logica'|'definitiva';monitorarCancelamentos?:boolean;intervaloCancelamentosMinutos?:number;acaoCancelamentoGmobii?:'excluir'|'devolver';monitorarAprovacoes?:boolean;intervaloAprovacoesMinutos?:number;atualizadoEm?:string };
+  const chaveConstrushow=(empresaId:string)=>`gmobii_construshow_${empresaId}`;
+  const conexaoOracleConstrushow=(id:string,empresaId:string)=>conexoes.find(item=>item.id===id&&(item.empresaId||item.clienteId)===empresaId&&item.tipoBanco==='oracle'&&item.status==='ativa');
+  const normalizarOpcoes=(linhas:any[],codigo:string,descricao:string)=>linhas.map(linha=>({codigo:Number(linha[codigo]??linha[codigo.toUpperCase()]??linha[codigo.toLowerCase()]),descricao:String(linha[descricao]??linha[descricao.toUpperCase()]??linha[descricao.toLowerCase()]??'')}));
+  app.get('/api/admin/integracoes/gmobii/construshow',async(request,reply)=>{const ctx=empresaContexto(request,reply);if(!ctx)return;if(!exigirPermissao(ctx.sessao,'integracao.configurar',reply,'Seu perfil não permite visualizar as configurações da integração.'))return;const configuracao=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(ctx.empresaId),null);return sucesso({configuracao,conexoes:conexoes.filter(c=>(c.empresaId||c.clienteId)===ctx.empresaId&&c.tipoBanco==='oracle'&&c.status==='ativa').map(semSenha)});});
+  app.put('/api/admin/integracoes/gmobii/construshow',async(request:any,reply)=>{const ctx=empresaContexto(request,reply);if(!ctx)return;const body=request.body??{};if(!conexaoOracleConstrushow(body.conexaoId,ctx.empresaId))return reply.status(400).send(erro('CONEXAO_ORACLE_INVALIDA','Selecione uma conexão Oracle ativa cadastrada para o Construshow.'));for(const campo of ['estab','estabProduto','estabNc','idNotaConf','validadeCarrinho','diasPrevisaoEntrega','intervaloIntegracaoMinutos'])if(body[campo]===undefined||body[campo]===null||body[campo]==='')return reply.status(400).send(erro('CONFIGURACAO_INCOMPLETA',`Preencha o campo ${campo}.`));const acaoCancelamentoGmobii=String(body.acaoCancelamentoGmobii??'excluir');if(!['excluir','devolver'].includes(acaoCancelamentoGmobii))return reply.status(400).send(erro('ACAO_CANCELAMENTO_INVALIDA','Selecione Excluir ou Retornar para o cancelamento do carrinho.'));const modoExclusaoPedidos=String(body.modoExclusaoPedidos??'logica');if(!['logica','definitiva'].includes(modoExclusaoPedidos))return reply.status(400).send(erro('MODO_EXCLUSAO_INVALIDO','Selecione exclusão lógica ou definitiva.'));const configuracao:ConfiguracaoConstrushow={conexaoId:body.conexaoId,estab:Number(body.estab),estabDescricao:body.estabDescricao,estabProduto:Number(body.estabProduto),estabProdutoDescricao:body.estabProdutoDescricao,estabNc:Number(body.estabNc),idNotaConf:Number(body.idNotaConf),notaConfDescricao:body.notaConfDescricao,idCliente:body.idCliente?Number(body.idCliente):undefined,clienteNome:body.clienteNome,idVendedor:body.idVendedor?Number(body.idVendedor):undefined,vendedorNome:body.vendedorNome,validadeCarrinho:Math.min(Math.max(Number(body.validadeCarrinho),0),999),diasPrevisaoEntrega:Math.min(Math.max(Number(body.diasPrevisaoEntrega??4),0),999),integracaoAutomatica:body.integracaoAutomatica===true,intervaloIntegracaoMinutos:Math.min(Math.max(Number(body.intervaloIntegracaoMinutos??5),1),1440),modoExclusaoPedidos:modoExclusaoPedidos as 'logica'|'definitiva',monitorarCancelamentos:body.monitorarCancelamentos!==false,intervaloCancelamentosMinutos:Math.min(Math.max(Number(body.intervaloCancelamentosMinutos??5),1),1440),acaoCancelamentoGmobii:acaoCancelamentoGmobii as 'excluir'|'devolver',monitorarAprovacoes:body.monitorarAprovacoes!==false,intervaloAprovacoesMinutos:Math.min(Math.max(Number(body.intervaloAprovacoesMinutos??5),1),1440),atualizadoEm:agora()};await store.salvarConfiguracao(chaveConstrushow(ctx.empresaId),configuracao);return sucesso(configuracao);});
+  app.get('/api/admin/integracoes/gmobii/construshow/opcoes',async(request:any,reply)=>{const ctx=empresaContexto(request,reply);if(!ctx)return;const {conexaoId,tipo,estabNc,busca}=request.query??{};const conexao=conexaoOracleConstrushow(String(conexaoId||''),ctx.empresaId);if(!conexao)return reply.status(400).send(erro('CONEXAO_ORACLE_INVALIDA','Selecione uma conexão Oracle ativa.'));try{if(tipo==='filiais'){const colunas=await sqlExecutor.executar(conexao,"SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME='FILIAL' AND COLUMN_NAME IN ('ATIVA','INATIVA','SITUACAO','STATUS')");const nomes=new Set(colunas.map((r:any)=>String(r.COLUMN_NAME??r.column_name)));const filtro=nomes.has('ATIVA')?"ATIVA='S'":nomes.has('INATIVA')?"COALESCE(INATIVA,'N')<>'S'":nomes.has('SITUACAO')?"SITUACAO='A'":nomes.has('STATUS')?"STATUS='A'":'1=1';const linhas=await sqlExecutor.executar(conexao,`SELECT ESTAB, REDUZIDO FROM FILIAL WHERE ${filtro} ORDER BY REDUZIDO`);return sucesso(normalizarOpcoes(linhas,'ESTAB','REDUZIDO'));}if(tipo==='filiais_produto'){const linhas=await sqlExecutor.executar(conexao,'SELECT F.ESTAB, F.REDUZIDO FROM FILIAL F WHERE EXISTS (SELECT 1 FROM ITEM I WHERE I.ESTAB=F.ESTAB) ORDER BY F.REDUZIDO');return sucesso(normalizarOpcoes(linhas,'ESTAB','REDUZIDO'));}if(tipo==='filiais_nota'){const linhas=await sqlExecutor.executar(conexao,'SELECT F.ESTAB, F.REDUZIDO FROM FILIAL F WHERE EXISTS (SELECT 1 FROM NOTACONF N WHERE N.ESTAB=F.ESTAB) ORDER BY F.REDUZIDO');return sucesso(normalizarOpcoes(linhas,'ESTAB','REDUZIDO'));}if(tipo==='notas'){const linhas=await sqlExecutor.executar(conexao,'SELECT IDNOTACONF, DESCRICAO FROM NOTACONF WHERE ESTAB = :estabNc ORDER BY DESCRICAO',{estabNc:Number(estabNc)});return sucesso(normalizarOpcoes(linhas,'IDNOTACONF','DESCRICAO'));}if(tipo==='pessoas'){const termo=String(busca||'').trim().toUpperCase();const linhas=await sqlExecutor.executar(conexao,`SELECT IDPESS, NOME FROM PESSOADOC WHERE (:busca IS NULL OR UPPER(NOME) LIKE :busca) ORDER BY NOME FETCH FIRST 100 ROWS ONLY`,{busca:termo?`%${termo}%`:null});return sucesso(normalizarOpcoes(linhas,'IDPESS','NOME'));}return reply.status(400).send(erro('TIPO_CONSULTA_INVALIDO','Tipo de consulta do Construshow inválido.'));}catch(error){return reply.status(502).send(erro('CONSULTA_CONSTRUSHOW_FALHOU',error instanceof Error?error.message:'Não foi possível consultar o Construshow.'));}});
+
+  app.post<{Params:{id:string};Body:{pedidoNumero?:string}}>('/api/admin/integracoes/:id/integrar-construshow',async(request,reply)=>{const acesso=await obterIntegracaoAutorizada(request.params.id,request,reply);if(!acesso)return;const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(acesso.ctx.empresaId),null);if(!config?.conexaoId||!config.estab||!config.estabProduto||!config.estabNc||!config.idNotaConf)return reply.status(400).send(erro('CONSTRUSHOW_NAO_CONFIGURADO','Complete a configuração do Construshow antes de integrar.'));const conexao=conexaoOracleConstrushow(config.conexaoId,acesso.ctx.empresaId);if(!conexao)return reply.status(400).send(erro('CONEXAO_ORACLE_INVALIDA','A conexão Oracle configurada não está disponível.'));const contratos=await construshowService.validarCamposObrigatorios(acesso.integracao.id,acesso.ctx.empresaId,request.body?.pedidoNumero);const bloqueados=contratos.filter((item)=>item.pendencias.length);if(request.body?.pedidoNumero&&bloqueados.length){const campos=bloqueados[0].pendencias.map((item)=>item.campo).join(', ');return reply.status(409).send(erro('PEDIDO_COM_CAMPOS_OBRIGATORIOS_PENDENTES',`O pedido não foi enviado ao Oracle. Corrija os campos obrigatórios: ${campos}.`))}const validacoes=await construshowService.preValidar(acesso.integracao.id,acesso.ctx.empresaId,conexao,config,request.body?.pedidoNumero);if(request.body?.pedidoNumero&&validacoes.some((v:any)=>v.status==='pendente'))return reply.status(409).send(erro('PEDIDO_NAO_APTO_PARA_INTEGRACAO','O pedido possui cadastros obrigatórios não localizados no ERP. Consulte a conferência do pedido.'));const resultados=await construshowService.integrar(acesso.integracao.id,acesso.ctx.empresaId,conexao,config,request.body?.pedidoNumero);for(const resultado of resultados.filter((r:any)=>r.status==='erro'))await notificacaoEmailService.notificarFalhaIntegracaoAgora(acesso.ctx.empresaId,String(resultado.pedido_gmobii),String(resultado.mensagem)).catch((e)=>request.log.error(e));if(request.body?.pedidoNumero&&!resultados.length)return reply.status(409).send(erro('PEDIDO_NAO_PROCESSADO','O pedido não foi processado. Consulte os alertas e as validações antes de tentar novamente.'));return sucesso({resultados,validacoes,bloqueados,total:resultados.length,integrados:resultados.filter((r:any)=>r.status==='integrado').length,erros:resultados.filter((r:any)=>r.status==='erro').length});});
+  app.get<{Params:{id:string}}>('/api/admin/integracoes/:id/dados-integrados',async(request,reply)=>{const acesso=await obterIntegracaoAutorizada(request.params.id,request,reply);if(!acesso)return;const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(acesso.ctx.empresaId),null);const conexao=config?.conexaoId?conexaoOracleConstrushow(config.conexaoId,acesso.ctx.empresaId):undefined;return sucesso(await construshowService.listar(acesso.integracao.id,acesso.ctx.empresaId,conexao));});
+  app.get<{Params:{id:string;registroId:string}}>('/api/admin/integracoes/:id/dados-integrados/:registroId/carrinho',async(request,reply)=>{const acesso=await obterIntegracaoAutorizada(request.params.id,request,reply);if(!acesso)return;const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(acesso.ctx.empresaId),null);const conexao=config?.conexaoId?conexaoOracleConstrushow(config.conexaoId,acesso.ctx.empresaId):undefined;if(!conexao)return reply.status(400).send(erro('CONEXAO_ORACLE_INVALIDA','A conexão Oracle configurada não está disponível.'));try{return sucesso(await construshowService.detalharCarrinho(acesso.integracao.id,acesso.ctx.empresaId,request.params.registroId,conexao))}catch(error){return reply.status(404).send(erro('CARRINHO_NAO_LOCALIZADO',error instanceof Error?error.message:'Não foi possível consultar o carrinho no Construshow.'))}});
+  app.delete<{Params:{id:string;registroId:string}}>('/api/admin/integracoes/:id/dados-integrados/:registroId',async(request,reply)=>{const acesso=await obterIntegracaoAutorizada(request.params.id,request,reply);if(!acesso)return;if(acesso.ctx.sessao.perfil!=='admin'&&!acesso.ctx.sessao.permissoesAcoes?.includes('integracao.excluir_pedido'))return reply.status(403).send(erro('ACESSO_NEGADO','Seu perfil não permite excluir tentativas de integração.'));const resultado=await construshowService.excluirTentativaComErro(request.params.registroId,acesso.integracao.id,acesso.ctx.empresaId);if(resultado.situacao==='nao_encontrado')return reply.status(404).send(erro('TENTATIVA_NAO_ENCONTRADA','A tentativa de integração não foi encontrada.'));if(resultado.situacao==='nao_permitido')return reply.status(409).send(erro('EXCLUSAO_NAO_PERMITIDA','Somente tentativas com erro e sem carrinho integrado podem ser excluídas.'));const usuario=usuarios.find((item)=>item.id===acesso.ctx.sessao.usuarioId);await integracaoRepository.salvarLog({id:randomUUID(),integracaoId:acesso.integracao.id,empresaId:acesso.ctx.empresaId,nivel:'aviso',evento:'tentativa_integracao_excluida',mensagem:`Tentativa com erro do pedido ${resultado.registro.pedido_gmobii} excluída por ${usuario?.nome??usuario?.email??acesso.ctx.sessao.usuarioId}.`,detalhes:{numeroPedido:resultado.registro.pedido_gmobii,registroIntegracaoId:resultado.registro.id,statusAnterior:resultado.registro.status,mensagemAnterior:resultado.registro.mensagem,usuarioId:acesso.ctx.sessao.usuarioId,usuarioNome:usuario?.nome,usuarioEmail:usuario?.email},criadoEm:agora()});return sucesso({mensagem:`A tentativa com erro do pedido ${resultado.registro.pedido_gmobii} foi excluída. Os dados coletados foram preservados.`,numeroPedido:resultado.registro.pedido_gmobii});});
+
+  const ultimaVerificacaoCancelamentos=new Map<string,number>();
+  const verificarCancelamentos=async()=>{for(const empresa of empresas){const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(empresa.id),null);if(!config?.monitorarCancelamentos||!config.conexaoId)continue;const intervalo=(config.intervaloCancelamentosMinutos??5)*60000;const ultima=ultimaVerificacaoCancelamentos.get(empresa.id)??0;if(Date.now()-ultima<intervalo)continue;ultimaVerificacaoCancelamentos.set(empresa.id,Date.now());const integracao=(await integracaoRepository.listarIntegracoes(empresa.id)).find((item)=>item.provedor==='gmobii');const conexao=conexaoOracleConstrushow(config.conexaoId,empresa.id);if(!integracao||!conexao)continue;const segredo=await integracaoRepository.obterCredencial(integracao.id);if(!segredo)continue;await construshowService.processarCancelamentos(integracao.id,empresa.id,conexao,descriptografarSegredo(segredo),integracao.urlBase,config.acaoCancelamentoGmobii??'excluir').catch((e)=>app.log.error(e));}};
+  const ultimaVerificacaoAprovacoes=new Map<string,number>();
+  const verificarAprovacoes=async()=>{for(const empresa of empresas){const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(empresa.id),null);if(config?.monitorarAprovacoes===false||!config?.conexaoId)continue;const intervalo=(config.intervaloAprovacoesMinutos??5)*60000;const ultima=ultimaVerificacaoAprovacoes.get(empresa.id)??0;if(Date.now()-ultima<intervalo)continue;ultimaVerificacaoAprovacoes.set(empresa.id,Date.now());const integracao=(await integracaoRepository.listarIntegracoes(empresa.id)).find((item)=>item.provedor==='gmobii');const conexao=conexaoOracleConstrushow(config.conexaoId,empresa.id);if(!integracao||!conexao)continue;const segredo=await integracaoRepository.obterCredencial(integracao.id);if(!segredo)continue;await construshowService.processarAprovacoes(integracao.id,empresa.id,conexao,descriptografarSegredo(segredo),integracao.urlBase).catch((e)=>app.log.error(e));}};
+  const timerCancelamentos=setInterval(()=>verificarCancelamentos().catch((e)=>app.log.error(e)),60000);timerCancelamentos.unref();
+  const inicioCancelamentos=setTimeout(()=>verificarCancelamentos().catch((e)=>app.log.error(e)),15000);inicioCancelamentos.unref();
+  const timerAprovacoes=setInterval(()=>verificarAprovacoes().catch((e)=>app.log.error(e)),60000);timerAprovacoes.unref();
+  const inicioAprovacoes=setTimeout(()=>verificarAprovacoes().catch((e)=>app.log.error(e)),18000);inicioAprovacoes.unref();
+  const coletasAutomaticasEmExecucao=new Set<string>();
+  const executarColetasAutomaticas=async()=>{for(const empresa of empresas){
+    const integracao=(await integracaoRepository.listarIntegracoes(empresa.id)).find(item=>item.provedor==='gmobii');
+    if(!integracao||integracao.status==='inativa'||coletasAutomaticasEmExecucao.has(integracao.id))continue;
+    const intervalo=Math.max(integracao.intervaloMinutos??15,1)*60000;
+    const ultima=integracao.ultimaSincronizacao?new Date(integracao.ultimaSincronizacao).getTime():0;
+    if(Number.isFinite(ultima)&&Date.now()-ultima<intervalo)continue;
+    coletasAutomaticasEmExecucao.add(integracao.id);
+    try{
+      await integracaoService.sincronizar(integracao);
+      const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(empresa.id),null);
+      const conexao=config?.conexaoId?conexaoOracleConstrushow(config.conexaoId,empresa.id):undefined;
+      if(config?.estab&&config.estabProduto&&config.estabNc&&config.idNotaConf&&conexao)await construshowService.preValidar(integracao.id,empresa.id,conexao,config);
+    }catch(error){app.log.error({empresaId:empresa.id,integracaoId:integracao.id,error},'Falha no ciclo de coleta automática da GMOBii.')}finally{coletasAutomaticasEmExecucao.delete(integracao.id)}
+  }};
+  const timerColetaAutomatica=setInterval(()=>executarColetasAutomaticas().catch((e)=>app.log.error(e)),10000);timerColetaAutomatica.unref();
+  const inicioColetaAutomatica=setTimeout(()=>executarColetasAutomaticas().catch((e)=>app.log.error(e)),10000);inicioColetaAutomatica.unref();
+  const ultimaIntegracaoAutomatica=new Map<string,number>();
+  const integracoesAutomaticasEmExecucao=new Set<string>();
+  const executarIntegracoesAutomaticas=async()=>{for(const empresa of empresas){
+    const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(empresa.id),null);
+    if(!config?.integracaoAutomatica||!config.conexaoId||!config.estab||!config.estabProduto||!config.estabNc||!config.idNotaConf)continue;
+    const intervalo=(config.intervaloIntegracaoMinutos??5)*60000;
+    const ultima=ultimaIntegracaoAutomatica.get(empresa.id)??0;
+    if(Date.now()-ultima<intervalo||integracoesAutomaticasEmExecucao.has(empresa.id))continue;
+    ultimaIntegracaoAutomatica.set(empresa.id,Date.now());integracoesAutomaticasEmExecucao.add(empresa.id);
+    try{
+      const integracao=(await integracaoRepository.listarIntegracoes(empresa.id)).find(item=>item.provedor==='gmobii');
+      const conexao=conexaoOracleConstrushow(config.conexaoId,empresa.id);
+      if(!integracao||!conexao)continue;
+      await construshowService.validarCamposObrigatorios(integracao.id,empresa.id);
+      await construshowService.preValidar(integracao.id,empresa.id,conexao,config);
+      const resultados=await construshowService.integrar(integracao.id,empresa.id,conexao,config);
+      for(const resultado of resultados.filter((item:any)=>item.status==='erro'))await notificacaoEmailService.notificarFalhaIntegracaoAgora(empresa.id,String(resultado.pedido_gmobii),String(resultado.mensagem)).catch((erroEnvio)=>app.log.error(erroEnvio));
+    }catch(error){app.log.error({empresaId:empresa.id,error},'Falha no ciclo de integração automática GMOBii → Construshow.')}finally{integracoesAutomaticasEmExecucao.delete(empresa.id)}
+  }};
+  const timerIntegracaoAutomatica=setInterval(()=>executarIntegracoesAutomaticas().catch((e)=>app.log.error(e)),10000);timerIntegracaoAutomatica.unref();
+  const inicioIntegracaoAutomatica=setTimeout(()=>executarIntegracoesAutomaticas().catch((e)=>app.log.error(e)),22000);inicioIntegracaoAutomatica.unref();
+  const executarPreValidacoes=async()=>{for(const empresa of empresas){const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(empresa.id),null);if(!config?.conexaoId||!config.estab||!config.estabProduto)continue;const integracao=(await integracaoRepository.listarIntegracoes(empresa.id)).find(item=>item.provedor==='gmobii');const conexao=conexaoOracleConstrushow(config.conexaoId,empresa.id);if(integracao&&conexao)await construshowService.preValidar(integracao.id,empresa.id,conexao,config).catch(e=>app.log.error(e));}};
+  const timerPreValidacao=setInterval(()=>executarPreValidacoes().catch(e=>app.log.error(e)),5*60000);timerPreValidacao.unref();
+  const inicioPreValidacao=setTimeout(()=>executarPreValidacoes().catch(e=>app.log.error(e)),20000);inicioPreValidacao.unref();
+  app.addHook('onClose',async()=>{clearInterval(timerCancelamentos);clearTimeout(inicioCancelamentos);clearInterval(timerAprovacoes);clearTimeout(inicioAprovacoes);clearInterval(timerColetaAutomatica);clearTimeout(inicioColetaAutomatica);clearInterval(timerIntegracaoAutomatica);clearTimeout(inicioIntegracaoAutomatica);clearInterval(timerPreValidacao);clearTimeout(inicioPreValidacao)});
+
+  app.get('/api/admin/integracoes/gmobii/construshow/filiais-ativas',async(request:any,reply)=>{const ctx=empresaContexto(request,reply);if(!ctx)return;const conexao=conexaoOracleConstrushow(String(request.query?.conexaoId||''),ctx.empresaId);if(!conexao)return reply.status(400).send(erro('CONEXAO_ORACLE_INVALIDA','Selecione uma conexão Oracle ativa.'));try{const colunas=await sqlExecutor.executar(conexao,"SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME='FILIAL' AND COLUMN_NAME IN ('ATIVA','INATIVA','SITUACAO','STATUS')");const nomes=new Set(colunas.map((r:any)=>String(r.COLUMN_NAME??r.column_name)));const filtro=nomes.has('ATIVA')?"ATIVA='S'":nomes.has('INATIVA')?"COALESCE(INATIVA,'N')<>'S'":nomes.has('SITUACAO')?"SITUACAO='A'":nomes.has('STATUS')?"STATUS='A'":'1=1';const linhas=await sqlExecutor.executar(conexao,`SELECT ESTAB,REDUZIDO FROM FILIAL WHERE ${filtro} ORDER BY REDUZIDO`);return sucesso(normalizarOpcoes(linhas,'ESTAB','REDUZIDO'));}catch(error){return reply.status(502).send(erro('CONSULTA_FILIAL_FALHOU',error instanceof Error?error.message:'Falha ao consultar filiais.'));}});
 
   app.get('/api/admin/apis', async (request, reply) => {
     const ctx = empresaContexto(request, reply);
@@ -1032,6 +1244,123 @@ export async function buildApp() {
     if (!ctx) return;
     const empresaApis = apis.filter((api) => (api.empresaId || api.clienteId) === ctx.empresaId).map((api) => api.id);
     return sucesso(logs.filter((log) => log.empresaId === ctx.empresaId || empresaApis.includes(log.apiId)));
+  });
+
+  const chaveNotificacoes=(empresaId:string)=>`notificacoes_email_${empresaId}`;
+  app.get('/api/admin/configuracoes/notificacoes',async(request,reply)=>{const ctx=empresaContexto(request,reply);if(!ctx)return;const config=await store.obterConfiguracao<ConfiguracaoNotificacao>(chaveNotificacoes(ctx.empresaId),configuracaoNotificacaoPadrao);return sucesso({...config,provedorConfigurado:await notificacaoEmailService.temChave()});});
+  app.put('/api/admin/configuracoes/notificacoes',async(request:any,reply)=>{const ctx=empresaContexto(request,reply);if(!ctx)return;if(!ctx.sessao.permissoesAcoes?.includes('notificacao.configurar'))return reply.status(403).send(erro('ACESSO_NEGADO','Seu perfil não permite alterar as notificações.'));const b=request.body??{};const emails=(v:any)=>[...new Set((Array.isArray(v)?v:String(v??'').split(/[,;\n]/)).map((e:any)=>String(e).trim().toLowerCase()).filter(Boolean))];const regra=(tipo:'integracao_critica'|'erro_api')=>({ativo:Boolean(b.tipos?.[tipo]?.ativo),envioImediato:Boolean(b.tipos?.[tipo]?.envioImediato),repetirEnquantoAberto:Boolean(b.tipos?.[tipo]?.repetirEnquantoAberto),destinatarios:emails(b.tipos?.[tipo]?.destinatarios)});const config:ConfiguracaoNotificacao={ativo:Boolean(b.ativo),inicio:String(b.inicio??'08:00'),fim:String(b.fim??'18:00'),intervaloMinutos:Number(b.intervaloMinutos??60),remetente:'notificacao@controlsone.com.br',tipos:{integracao_critica:regra('integracao_critica'),erro_api:regra('erro_api')}};try{notificacaoEmailService.validar(config);if(String(b.chaveResend??'').trim())await notificacaoEmailService.configurarChave(String(b.chaveResend).trim())}catch(e){return reply.status(400).send(erro('CONFIGURACAO_NOTIFICACAO_INVALIDA',e instanceof Error?e.message:'Configuração inválida.'))}await store.salvarConfiguracao(chaveNotificacoes(ctx.empresaId),config);return sucesso({...config,provedorConfigurado:await notificacaoEmailService.temChave()});});
+  app.post('/api/admin/configuracoes/notificacoes/testar',async(request,reply)=>{const ctx=empresaContexto(request,reply);if(!ctx)return;if(!ctx.sessao.permissoesAcoes?.includes('notificacao.configurar'))return reply.status(403).send(erro('ACESSO_NEGADO','Seu perfil não permite testar as notificações.'));if(!await notificacaoEmailService.temChave())return reply.status(409).send(erro('PROVEDOR_EMAIL_NAO_CONFIGURADO','Valide o domínio no Resend e configure a chave do provedor.'));const config=await store.obterConfiguracao<ConfiguracaoNotificacao>(chaveNotificacoes(ctx.empresaId),configuracaoNotificacaoPadrao);try{await notificacaoEmailService.testar(config);return sucesso({mensagem:'E-mail de teste enviado.'})}catch(e){return reply.status(502).send(erro('ENVIO_EMAIL_FALHOU',e instanceof Error?e.message:'Falha ao enviar e-mail.'))}});
+
+  app.get('/api/admin/perfis-acesso', async (request, reply) => { const sessao=exigirGerenciamentoUsuarios(request, reply);if(!sessao)return;return sucesso(sessao.perfil==='admin'?perfisAcesso:perfisAcesso.filter((perfil)=>!perfilAcessoAdministrador(perfil.id))); });
+  app.post('/api/admin/perfis-acesso', async (request:any, reply) => {
+    if (!exigirAdmin(request, reply)) return; const body=request.body??{};
+    if(!body.nome?.trim()) return reply.status(400).send(erro('NOME_PERFIL_OBRIGATORIO','Informe o nome do perfil.'));
+    const perfil={id:randomUUID(),nome:body.nome.trim(),descricao:body.descricao?.trim(),menusPermitidos:(body.menusPermitidos??[]).filter((m:string)=>todosMenus.includes(m)),permissoesAcoes:body.permissoesAcoes??[],tiposAlerta:body.tiposAlerta??[],padrao:false,ativo:body.ativo!==false,criadoEm:agora()};
+    perfisAcesso.unshift(perfil); await store.salvar('perfisAcesso',perfil); return reply.status(201).send(sucesso(perfil));
+  });
+  app.put<{Params:{id:string}}>('/api/admin/perfis-acesso/:id', async (request:any, reply) => {
+    if (!exigirAdmin(request, reply)) return; const perfil=perfisAcesso.find((p)=>p.id===request.params.id); if(!perfil)return reply.status(404).send(erro('PERFIL_NAO_ENCONTRADO','Perfil de acesso nao encontrado.'));
+    const body=request.body??{}; perfil.nome=body.nome?.trim()||perfil.nome; perfil.descricao=body.descricao?.trim(); perfil.menusPermitidos=(body.menusPermitidos??perfil.menusPermitidos).filter((m:string)=>todosMenus.includes(m)); perfil.permissoesAcoes=body.permissoesAcoes??perfil.permissoesAcoes??[]; perfil.tiposAlerta=body.tiposAlerta??perfil.tiposAlerta??[]; perfil.ativo=body.ativo!==false; perfil.atualizadoEm=agora(); await store.salvar('perfisAcesso',perfil); return sucesso(perfil);
+  });
+  app.delete<{Params:{id:string}}>('/api/admin/perfis-acesso/:id', async (request,reply)=>{
+    if(!exigirAdmin(request,reply))return; const perfil=perfisAcesso.find((p)=>p.id===request.params.id); if(!perfil)return reply.status(404).send(erro('PERFIL_NAO_ENCONTRADO','Perfil de acesso nao encontrado.')); if(perfil.padrao)return reply.status(409).send(erro('PERFIL_PADRAO','O perfil Admin padrao nao pode ser excluido.')); if(usuarios.some((u)=>u.perfilAcessoId===perfil.id))return reply.status(409).send(erro('PERFIL_EM_USO','O perfil possui usuarios vinculados.')); perfisAcesso.splice(perfisAcesso.indexOf(perfil),1);await store.excluir('perfisAcesso',perfil.id);return sucesso({id:perfil.id,excluido:true});
+  });
+
+  app.post<{ Body: { email?: string; senhaAtual?: string; novaSenha?: string; confirmarSenha?: string } }>('/api/auth/alterar-senha', async (request, reply) => {
+    const email = request.body?.email?.trim().toLowerCase();
+    const senhaAtual = request.body?.senhaAtual ?? '';
+    const novaSenha = request.body?.novaSenha ?? '';
+    const confirmarSenha = request.body?.confirmarSenha ?? '';
+    const usuario = usuarios.find((item) => item.email.toLowerCase() === email && item.status === 'ativo');
+    if (!usuario || !senhaConfere(usuario, senhaAtual)) return reply.status(401).send(erro('CREDENCIAIS_INVALIDAS', 'E-mail ou senha atual invalidos.'));
+    if (novaSenha.length < 8) return reply.status(400).send(erro('SENHA_INVALIDA', 'A nova senha deve ter pelo menos 8 caracteres.'));
+    if (novaSenha !== confirmarSenha) return reply.status(400).send(erro('CONFIRMACAO_SENHA_INVALIDA', 'A confirmacao nao corresponde a nova senha.'));
+    if (novaSenha === senhaAtual) return reply.status(400).send(erro('SENHA_NAO_ALTERADA', 'A nova senha deve ser diferente da senha atual.'));
+    usuario.senhaHash = hashSenha(novaSenha);
+    usuario.primeiroAcesso = false;
+    await store.salvar('usuarios', usuario);
+    for (const [token, sessao] of sessoes) if (sessao.usuarioId === usuario.id) sessoes.delete(token);
+    return sucesso({ mensagem: 'Senha alterada com sucesso. Entre novamente com a nova senha.' });
+  });
+
+  app.get('/api/admin/integracoes', async (request, reply) => {
+    const ctx = empresaContexto(request, reply);
+    if (!ctx) return;
+    return sucesso(await integracaoRepository.listarIntegracoes(ctx.empresaId));
+  });
+
+  app.post('/api/admin/integracoes/gmobii', async (request: any, reply) => {
+    const ctx = empresaContexto(request, reply);
+    if (!ctx) return;
+    if (ctx.sessao.perfil === 'visualizador') return reply.status(403).send(erro('ACESSO_NEGADO', 'Seu perfil nao permite alterar integracoes.'));
+    const token = String(request.body?.token ?? '').trim();
+    if (token && !token.startsWith('gmb_')) return reply.status(400).send(erro('TOKEN_GMOBII_INVALIDO', 'O token da GMOBii deve iniciar com gmb_.'));
+    const item = await integracaoService.configurar(ctx.empresaId, request.body ?? {});
+    return sucesso(item);
+  });
+
+  async function obterIntegracaoAutorizada(id: string, request: any, reply: any) {
+    const ctx = empresaContexto(request, reply);
+    if (!ctx) return undefined;
+    const integracao = await integracaoRepository.obterIntegracao(id, ctx.empresaId);
+    if (!integracao) { reply.status(404).send(erro('INTEGRACAO_NAO_ENCONTRADA', 'Integracao nao encontrada para esta empresa.')); return undefined; }
+    return { ctx, integracao };
+  }
+
+  app.post<{ Params: { id: string } }>('/api/admin/integracoes/:id/testar', async (request, reply) => {
+    const acesso = await obterIntegracaoAutorizada(request.params.id, request, reply);
+    if (!acesso) return;
+    try { return sucesso(await integracaoService.testar(acesso.integracao)); }
+    catch (error) { const falha=error as ErroIntegracao; return reply.status(falha.statusHttp && falha.statusHttp < 500 ? 400 : 502).send(erro(falha.codigo || 'FALHA_INTEGRACAO', falha.message)); }
+  });
+  app.get<{Params:{id:string}}>('/api/admin/integracoes/:id/credencial', async(request,reply)=>{ const sessao=exigirAdmin(request,reply);if(!sessao)return;const acesso=await obterIntegracaoAutorizada(request.params.id,request,reply);if(!acesso)return;const segredo=await integracaoRepository.obterCredencial(acesso.integracao.id);if(!segredo)return reply.status(404).send(erro('TOKEN_NAO_CONFIGURADO','Token ainda nao configurado.'));return sucesso({token:descriptografarSegredo(segredo)}); });
+
+  app.post<{ Params: { id: string } }>('/api/admin/integracoes/:id/sincronizar', async (request, reply) => {
+    const acesso = await obterIntegracaoAutorizada(request.params.id, request, reply);
+    if (!acesso) return;
+    if (acesso.integracao.status === 'inativa') return reply.status(400).send(erro('INTEGRACAO_INATIVA', 'Ative a integracao antes de sincronizar.'));
+    try {
+      const execucao=await integracaoService.sincronizar(acesso.integracao);
+      const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(acesso.ctx.empresaId),null);
+      const conexao=config?.conexaoId?conexaoOracleConstrushow(config.conexaoId,acesso.ctx.empresaId):undefined;
+      if(config?.estab&&config.estabProduto&&config.estabNc&&config.idNotaConf&&conexao)await construshowService.preValidar(acesso.integracao.id,acesso.ctx.empresaId,conexao,config).catch((erroPreValidacao)=>request.log.error(erroPreValidacao));
+      return sucesso(execucao);
+    }
+    catch (error) { const falha=error as ErroIntegracao; return reply.status(falha.statusHttp && falha.statusHttp < 500 ? 400 : 502).send(erro(falha.codigo || 'FALHA_INTEGRACAO', falha.message)); }
+  });
+
+  app.get<{ Params: { id: string } }>('/api/admin/integracoes/:id/execucoes', async (request, reply) => {
+    const acesso = await obterIntegracaoAutorizada(request.params.id, request, reply); if (!acesso) return;
+    return sucesso(await integracaoRepository.listarExecucoes(acesso.integracao.id, acesso.ctx.empresaId));
+  });
+  app.get<{ Params: { id: string } }>('/api/admin/integracoes/:id/logs', async (request, reply) => {
+    const acesso = await obterIntegracaoAutorizada(request.params.id, request, reply); if (!acesso) return;
+    return sucesso(await integracaoRepository.listarLogs(acesso.integracao.id, acesso.ctx.empresaId));
+  });
+  app.get<{ Params: { id: string }; Querystring: { pagina?: string; quantidadePorPagina?: string; busca?: string; tipoServico?: string; somenteAlertas?: string; situacaoExclusao?: string; dataInicial?: string; dataFinal?: string } }>('/api/admin/integracoes/:id/dados', async (request, reply) => {
+    const acesso = await obterIntegracaoAutorizada(request.params.id, request, reply); if (!acesso) return;
+    const pagina=Math.max(Number(request.query?.pagina??1),1); const quantidadePorPagina=Math.min(Math.max(Number(request.query?.quantidadePorPagina??20),5),100);
+    return sucesso(await integracaoRepository.listarDados(acesso.integracao.id, acesso.ctx.empresaId, {pagina,quantidadePorPagina,busca:request.query?.busca,tipoServico:request.query?.tipoServico,somenteAlertas:request.query?.somenteAlertas,situacaoExclusao:request.query?.situacaoExclusao,dataInicial:request.query?.dataInicial,dataFinal:request.query?.dataFinal}));
+  });
+  app.delete<{Params:{id:string;dadoId:string}}>('/api/admin/integracoes/:id/dados/:dadoId',async(request,reply)=>{
+    const acesso=await obterIntegracaoAutorizada(request.params.id,request,reply);if(!acesso)return;
+    if(acesso.ctx.sessao.perfil!=='admin'&&!acesso.ctx.sessao.permissoesAcoes?.includes('integracao.excluir_pedido'))return reply.status(403).send(erro('ACESSO_NEGADO','Seu perfil não permite excluir pedidos coletados.'));
+    const usuario=usuarios.find((item)=>item.id===acesso.ctx.sessao.usuarioId);
+    const config=await store.obterConfiguracao<ConfiguracaoConstrushow|null>(chaveConstrushow(acesso.ctx.empresaId),null);
+    const resultado=await integracaoRepository.excluirDadoNaoIntegrado(request.params.dadoId,acesso.integracao.id,acesso.ctx.empresaId,{definitiva:config?.modoExclusaoPedidos==='definitiva',usuarioId:acesso.ctx.sessao.usuarioId,usuarioNome:usuario?.nome??usuario?.email??acesso.ctx.sessao.usuarioId});
+    if(resultado.situacao==='nao_encontrado')return reply.status(404).send(erro('PEDIDO_NAO_ENCONTRADO','O pedido coletado não foi encontrado.'));
+    if(resultado.situacao==='integrado')return reply.status(409).send(erro('PEDIDO_JA_INTEGRADO',`O pedido já foi integrado ao carrinho ${resultado.integracao.id_carrinho??''} e não pode ser excluído.`));
+    await integracaoRepository.salvarLog({id:randomUUID(),integracaoId:acesso.integracao.id,empresaId:acesso.ctx.empresaId,nivel:'aviso',evento:'pedido_coletado_excluido',mensagem:`Pedido ${resultado.dado.chaveExterna} excluído manualmente por ${usuario?.nome??usuario?.email??acesso.ctx.sessao.usuarioId}.`,detalhes:{numeroPedido:resultado.dado.chaveExterna,usuarioId:acesso.ctx.sessao.usuarioId,usuarioNome:usuario?.nome,usuarioEmail:usuario?.email,tentativasComErroRemovidas:resultado.tentativasRemovidas,dadoExcluido:resultado.dado},criadoEm:agora()});
+    return sucesso({mensagem:`Pedido ${resultado.dado.chaveExterna} excluído de forma ${resultado.modo}. A operação foi registrada nos logs.`,numeroPedido:resultado.dado.chaveExterna,modo:resultado.modo});
+  });
+  app.get('/api/admin/alertas-integracao', async (request, reply) => {
+    const ctx = empresaContexto(request, reply); if (!ctx) return;
+    return sucesso(await integracaoRepository.listarAlertas(ctx.empresaId));
+  });
+  app.put<{ Params: { id: string } }>('/api/admin/alertas-integracao/:id/lido', async (request, reply) => {
+    const ctx = empresaContexto(request, reply); if (!ctx) return;
+    if (!await integracaoRepository.marcarAlertaLido(request.params.id, ctx.empresaId)) return reply.status(404).send(erro('ALERTA_NAO_ENCONTRADO', 'Alerta nao encontrado.'));
+    return sucesso({ mensagem: 'Alerta marcado como lido.' });
   });
   app.delete<{ Params: { id: string } }>('/api/admin/logs/:id', async (request, reply) => {
     const ctx = empresaContexto(request, reply);

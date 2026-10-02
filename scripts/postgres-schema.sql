@@ -43,3 +43,6 @@ WHERE tipo = 'apis'
     OR dados->'regras'->>'paginacaoPermitida' IS NULL
     OR dados->'regras'->>'quantidadeMaximaPorPagina' IS NULL
   );
+
+-- Carrega tambem as estruturas aditivas do modulo de Integracoes.
+\ir ../apps/backend/src/database/postgres.sql

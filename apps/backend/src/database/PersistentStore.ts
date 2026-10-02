@@ -8,7 +8,8 @@ import {
   LogChamada,
   TokenAcesso,
   Usuario,
-  UsuarioEmpresa
+  UsuarioEmpresa,
+  PerfilAcesso
 } from '../domain/types.js';
 
 export type TipoEntidade =
@@ -19,7 +20,8 @@ export type TipoEntidade =
   | 'logs'
   | 'usuarios'
   | 'usuariosEmpresas'
-  | 'clientesConsumidores';
+  | 'clientesConsumidores'
+  | 'perfisAcesso';
 
 export interface IdentidadeLoja {
   nomeLoja: string;
@@ -44,6 +46,7 @@ export interface SeedData {
   usuarios: Usuario[];
   usuariosEmpresas?: UsuarioEmpresa[];
   clientesConsumidores?: ClienteConsumidor[];
+  perfisAcesso?: PerfilAcesso[];
 }
 
 export class PersistentStore {
@@ -56,7 +59,8 @@ export class PersistentStore {
   usuarios: Usuario[] = [];
   usuariosEmpresas: UsuarioEmpresa[] = [];
   clientesConsumidores: ClienteConsumidor[] = [];
-  identidade: IdentidadeLoja = { nomeLoja: 'Cliente integrado', logoUrl: '/brand/logo-s-novo.jpg' };
+  perfisAcesso: PerfilAcesso[] = [];
+  identidade: IdentidadeLoja = { nomeLoja: 'Empresa', descricaoCurta: 'Empresa integrada', logoUrl: '/brand/logo-s-novo.jpg' };
   publicacao: PublicacaoConfig = {
     ambiente: 'local',
     dominioPrincipal: 'localhost',
@@ -75,6 +79,7 @@ export class PersistentStore {
     await this.seedSeNecessario('usuarios', seed.usuarios);
     await this.seedSeNecessario('usuariosEmpresas', seed.usuariosEmpresas ?? []);
     await this.seedSeNecessario('clientesConsumidores', seed.clientesConsumidores ?? []);
+    await this.seedSeNecessario('perfisAcesso', seed.perfisAcesso ?? []);
     await this.seedIdentidade();
     await this.seedPublicacao();
     await this.carregar();
@@ -108,6 +113,7 @@ export class PersistentStore {
     this.usuarios = await this.listar<Usuario>('usuarios');
     this.usuariosEmpresas = await this.listar<UsuarioEmpresa>('usuariosEmpresas');
     this.clientesConsumidores = await this.listar<ClienteConsumidor>('clientesConsumidores');
+    this.perfisAcesso = await this.listar<PerfilAcesso>('perfisAcesso');
     this.identidade = await this.obterConfiguracao<IdentidadeLoja>('identidade_loja', this.identidade);
     this.publicacao = await this.obterConfiguracao<PublicacaoConfig>('publicacao', this.publicacao);
   }
