@@ -728,6 +728,7 @@ footer {
 .jsonInspector .eyebrow { color:#8ca1bb; }
 .jsonInspector pre { max-height:480px; margin:12px 0 0; border:1px solid #28374a; }
 .modalBackdrop { position:fixed; z-index:1000; inset:0; display:grid; place-items:center; padding:24px; background:rgba(3,10,17,.68); backdrop-filter:blur(7px); animation:modalFade .16s ease-out; }
+.modalBackdrop:has(.cartDetails) { z-index:1100; }
 .modalCard { width:min(760px,calc(100vw - 32px)); max-height:calc(100vh - 48px); overflow:auto; border:1px solid rgba(46,230,111,.22); border-radius:14px; background:#fff; box-shadow:0 28px 90px rgba(0,0,0,.38); animation:modalUp .2s ease-out; }
 .modalCard.sucesso { border-top:4px solid #25ad5f; }
 .modalCard.erro { border-top:4px solid #d92d20; }

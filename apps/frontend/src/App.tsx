@@ -885,6 +885,13 @@ function Modal({
 type VideoTreinamentoGmobii={nome:string;titulo:string;formato:string;mimeType:string;tamanhoBytes:number;atualizadoEm:string;reproducaoNativa:boolean;url:string};
 function tamanhoArquivo(valor:number){if(valor<1024)return `${valor} B`;if(valor<1024*1024)return `${(valor/1024).toFixed(1)} KB`;if(valor<1024*1024*1024)return `${(valor/1024/1024).toFixed(1)} MB`;return `${(valor/1024/1024/1024).toFixed(2)} GB`}
 
+function CampoDestinatarios({valor,desabilitado=false,aoAlterar}:{valor:string[];desabilitado?:boolean;aoAlterar:(emails:string[])=>void}){
+  const assinatura=valor.join("; ");
+  const [texto,setTexto]=useState(assinatura);
+  useEffect(()=>setTexto(assinatura),[assinatura]);
+  return <input type="text" disabled={desabilitado} value={texto} placeholder="email1@empresa.com.br; email2@empresa.com.br" onChange={event=>{const novoTexto=event.target.value;setTexto(novoTexto);aoAlterar(novoTexto.split(/[;,]/).map(email=>email.trim()).filter(Boolean))}}/>;
+}
+
 function DocumentacaoGmobii() {
   const [documentacaoAtiva,setDocumentacaoAtiva]=useState<"api"|"hub">("api");
   const [bibliotecaVideosAberta,setBibliotecaVideosAberta]=useState(false);
@@ -3108,6 +3115,7 @@ export function App() {
     const integracao=integracoes[0];
     if(!integracao||!item.id_carrinho)return;
     try{
+      setIndicadorSelecionado(null);setDadoJsonSelecionado(null);setLogPedidoSelecionado(null);setModalAlertas(false);
       setCarregandoCarrinho(item.id);
       setCarrinhoSelecionado(await request<DetalheCarrinhoConstrushow>(`/api/admin/integracoes/${integracao.id}/dados-integrados/${item.id}/carrinho`));
     }catch(error){falhar(error)}finally{setCarregandoCarrinho("")}
@@ -4103,7 +4111,7 @@ export function App() {
                             <td><button className="orderLink" onClick={()=>abrirModalPedido(dadoDoRegistroIntegrado(item),item)}>{item.pedido_gmobii}</button></td>
                             <td>{String(item.dados_coletados?.cliente??"-")}</td>
                             <td>{item.estab??"-"}</td>
-                            <td>{item.id_carrinho?<button className="orderLink" disabled={carregandoCarrinho===item.id} title="Abrir dados do carrinho no Construshow" onClick={()=>{setIndicadorSelecionado(null);void abrirCarrinhoConstrushow(item)}}>{carregandoCarrinho===item.id?"Abrindo...":item.id_carrinho}</button>:"-"}</td>
+                            <td>{item.id_carrinho?<button className="orderLink" disabled={carregandoCarrinho===item.id} title="Abrir dados do carrinho no Construshow" onClick={()=>void abrirCarrinhoConstrushow(item)}>{carregandoCarrinho===item.id?"Abrindo...":item.id_carrinho}</button>:"-"}</td>
                             <td>{item.id_nota??"-"}</td>
                             <td><strong>{situacaoOperacionalCarrinho(item)}</strong></td>
                           </tr>
@@ -4652,7 +4660,7 @@ export function App() {
                       <label className="checkLine"><input type="checkbox" disabled={!podeConfigurarNotificacoes} checked={configuracaoNotificacao.tipos.integracao_critica.ativo} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,integracao_critica:{...configuracaoNotificacao.tipos.integracao_critica,ativo:e.target.checked}}})}/>Usar esta notificação</label>
                       <label className="checkLine"><input type="checkbox" disabled={!podeConfigurarNotificacoes} checked={configuracaoNotificacao.tipos.integracao_critica.envioImediato} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,integracao_critica:{...configuracaoNotificacao.tipos.integracao_critica,envioImediato:e.target.checked}}})}/>Enviar assim que ocorrer</label>
                       <label className="checkLine"><input type="checkbox" disabled={!podeConfigurarNotificacoes} checked={configuracaoNotificacao.tipos.integracao_critica.repetirEnquantoAberto} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,integracao_critica:{...configuracaoNotificacao.tipos.integracao_critica,repetirEnquantoAberto:e.target.checked}}})}/>Repetir enquanto estiver aberto</label>
-                      <label>Destinatários<input type="text" disabled={!podeConfigurarNotificacoes} value={configuracaoNotificacao.tipos.integracao_critica.destinatarios.join("; ")} placeholder="email1@empresa.com.br; email2@empresa.com.br" onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,integracao_critica:{...configuracaoNotificacao.tipos.integracao_critica,destinatarios:e.target.value.split(/[;,]/).map(v=>v.trim()).filter(Boolean)}}})}/><small className="inputHint">Para mais de um destinatário, separe os e-mails com ponto e vírgula (;).</small></label>
+                      <label>Destinatários<CampoDestinatarios desabilitado={!podeConfigurarNotificacoes} valor={configuracaoNotificacao.tipos.integracao_critica.destinatarios} aoAlterar={destinatarios=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,integracao_critica:{...configuracaoNotificacao.tipos.integracao_critica,destinatarios}}})}/><small className="inputHint">Para mais de um destinatário, separe os e-mails com ponto e vírgula (;).</small></label>
                     </div>
                   </section>
                   <p className="hint">
@@ -6700,7 +6708,7 @@ Authorization: Bearer TOKEN_DO_CLIENTE`}</pre>
             <label>Fim da janela<input type="time" value={configuracaoNotificacao.fim} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,fim:e.target.value})}/></label>
             <label>Repetir a cada (minutos)<input type="number" min="5" max="1440" value={configuracaoNotificacao.intervaloMinutos} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,intervaloMinutos:Number(e.target.value)})}/></label>
           </div>
-          {(()=>{const regra=configuracaoNotificacao.tipos.erro_api;return <section className="notificationRule"><div><h3>Erro interno de API</h3><p>Respostas HTTP 500 ou superiores nas APIs publicadas.</p></div><div className="formGrid"><label className="checkLine"><input type="checkbox" checked={regra.ativo} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,erro_api:{...regra,ativo:e.target.checked}}})}/>Usar esta notificação</label><label className="checkLine"><input type="checkbox" checked={regra.envioImediato} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,erro_api:{...regra,envioImediato:e.target.checked}}})}/>Enviar assim que ocorrer</label><label className="checkLine"><input type="checkbox" checked={regra.repetirEnquantoAberto} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,erro_api:{...regra,repetirEnquantoAberto:e.target.checked}}})}/>Repetir enquanto estiver aberto</label><label>Destinatários<input type="text" value={regra.destinatarios.join('; ')} placeholder="email1@empresa.com.br; email2@empresa.com.br" onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,erro_api:{...regra,destinatarios:e.target.value.split(/[;,]/).map(v=>v.trim()).filter(Boolean)}}})}/><small className="inputHint">Para mais de um destinatário, separe os e-mails com ponto e vírgula (;).</small></label></div></section>})()}
+          {(()=>{const regra=configuracaoNotificacao.tipos.erro_api;return <section className="notificationRule"><div><h3>Erro interno de API</h3><p>Respostas HTTP 500 ou superiores nas APIs publicadas.</p></div><div className="formGrid"><label className="checkLine"><input type="checkbox" checked={regra.ativo} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,erro_api:{...regra,ativo:e.target.checked}}})}/>Usar esta notificação</label><label className="checkLine"><input type="checkbox" checked={regra.envioImediato} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,erro_api:{...regra,envioImediato:e.target.checked}}})}/>Enviar assim que ocorrer</label><label className="checkLine"><input type="checkbox" checked={regra.repetirEnquantoAberto} onChange={e=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,erro_api:{...regra,repetirEnquantoAberto:e.target.checked}}})}/>Repetir enquanto estiver aberto</label><label>Destinatários<CampoDestinatarios valor={regra.destinatarios} aoAlterar={destinatarios=>setConfiguracaoNotificacao({...configuracaoNotificacao,tipos:{...configuracaoNotificacao.tipos,erro_api:{...regra,destinatarios}}})}/><small className="inputHint">Para mais de um destinatário, separe os e-mails com ponto e vírgula (;).</small></label></div></section>})()}
           <p className="hint">A janela utiliza o horário de Brasília. Todos os pedidos com problema são agrupados em um único e-mail. O envio imediato acontece no momento da falha; a repetição continua no intervalo escolhido até os alertas serem resolvidos.</p>
         </form>
       </section>
